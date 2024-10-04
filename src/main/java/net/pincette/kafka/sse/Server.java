@@ -4,6 +4,7 @@ import static io.netty.buffer.Unpooled.wrappedBuffer;
 import static io.netty.handler.codec.http.HttpResponseStatus.INTERNAL_SERVER_ERROR;
 import static io.netty.handler.codec.http.HttpResponseStatus.OK;
 import static io.netty.handler.codec.http.HttpResponseStatus.UNAUTHORIZED;
+import static java.lang.Boolean.FALSE;
 import static java.lang.System.getenv;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.time.Duration.ofSeconds;
@@ -12,6 +13,7 @@ import static java.util.Optional.ofNullable;
 import static java.util.UUID.randomUUID;
 import static java.util.concurrent.CompletableFuture.completedFuture;
 import static java.util.logging.Level.SEVERE;
+import static java.util.regex.Pattern.compile;
 import static java.util.stream.Collectors.groupingBy;
 import static java.util.stream.Collectors.maxBy;
 import static java.util.stream.Collectors.toSet;
@@ -41,6 +43,7 @@ import static net.pincette.util.Collections.map;
 import static net.pincette.util.Collections.merge;
 import static net.pincette.util.Collections.set;
 import static net.pincette.util.Pair.pair;
+import static net.pincette.util.ScheduledCompletionStage.composeAsyncAfter;
 import static net.pincette.util.StreamUtil.rangeExclusive;
 import static net.pincette.util.StreamUtil.tail;
 import static net.pincette.util.Util.tryToDoWithRethrow;
@@ -58,6 +61,7 @@ import com.typesafe.config.Config;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.handler.codec.http.HttpRequest;
+import java.time.Duration;
 import java.util.Collection;
 import java.util.Map;
 import java.util.Map.Entry;
@@ -69,6 +73,7 @@ import java.util.concurrent.Flow.Publisher;
 import java.util.function.BiConsumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import java.util.regex.Pattern;
 import javax.json.JsonObject;
 import net.pincette.json.JsonUtil;
 import net.pincette.kafka.json.JsonDeserializer;
@@ -84,6 +89,7 @@ import net.pincette.rs.kafka.KafkaPublisher;
 import net.pincette.util.State;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.ConsumerGroupDescription;
+import org.apache.kafka.clients.admin.ConsumerGroupListing;
 import org.apache.kafka.clients.admin.MemberDescription;
 import org.apache.kafka.clients.admin.MemberToRemove;
 import org.apache.kafka.clients.admin.RemoveMembersFromConsumerGroupOptions;
@@ -98,6 +104,7 @@ import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 
 public class Server {
+  private static final Duration CLEAN_UP_INTERVAL = ofSeconds(60);
   private static final String CONSUMER_GPOUP_ID = "consumerGroupId";
   private static final String DEFAULT_EVENT_NAME = "message";
   private static final String DEFAULT_INSTANCE = randomUUID().toString();
@@ -105,6 +112,7 @@ public class Server {
   private static final String EVENT_NAME = "eventName";
   private static final String EVENT_NAME_FIELD = "eventNameField";
   private static final String INSTANCE_ENV = "INSTANCE";
+  private static final Pattern INDEX_SUFFIX = compile("-\\d+");
   private static final String JWT_PUBLIC_KEY = "jwtPublicKey";
   private static final String KAFKA = "kafka";
   private static final int MAX_EXISTING_CONSUMER_GROUPS = 10;
@@ -112,9 +120,11 @@ public class Server {
   private static final String TOPIC = "topic";
   private static final String USERNAME_FIELD = "usernameField";
 
+  private final Admin admin;
   private final Config config;
   private final BiConsumer<ConsumerEvent, KafkaConsumer<String, JsonObject>> eventHandler;
   private final HttpServer httpServer;
+  private final Map<String, Object> kafkaConfig;
   private final int port;
 
   private Server(
@@ -124,12 +134,13 @@ public class Server {
     this.port = port;
     this.config = config;
     this.eventHandler = eventHandler;
+    kafkaConfig = config != null ? fromConfig(config, KAFKA) : null;
     httpServer =
         port != -1 && config != null
             ? new HttpServer(
-                port,
-                wrapTracing(handle(headerHandler(config)).finishWith(handler(config)), LOGGER))
+                port, wrapTracing(handle(headerHandler(config)).finishWith(handler()), LOGGER))
             : null;
+    admin = kafkaConfig != null ? Admin.create(adminConfig(kafkaConfig)) : null;
   }
 
   public Server() {
@@ -160,6 +171,23 @@ public class Server {
     return eventHandler != null ? eventHandler.andThen(check) : check;
   }
 
+  private static CompletionStage<Void> cleanUpConsumerGroups(
+      final String topic, final Admin admin) {
+    return admin
+        .listConsumerGroups()
+        .all()
+        .toCompletionStage()
+        .thenApply(c -> emptySseConsumerGroups(c, topic))
+        .thenApply(Server::logDeleteConsumerGroups)
+        .thenComposeAsync(
+            groupIds -> admin.deleteConsumerGroups(groupIds).all().toCompletionStage())
+        .exceptionally(
+            t -> {
+              LOGGER.log(SEVERE, t.getMessage(), t);
+              return null; // By this time some groups may be active again.
+            });
+  }
+
   private static Function<String, KafkaConsumer<String, JsonObject>> consumer(
       final String groupInstanceId, final Map<String, Object> config) {
     return group ->
@@ -176,6 +204,15 @@ public class Server {
 
   private static JsonObject createRaceCheckMessage(final String consumerGroupId) {
     return createObjectBuilder().add(CONSUMER_GPOUP_ID, consumerGroupId).build();
+  }
+
+  private static Collection<String> emptySseConsumerGroups(
+      final Collection<ConsumerGroupListing> consumerGroups, final String topic) {
+    return consumerGroups.stream()
+        .filter(l -> l.state().map(s -> s == EMPTY).orElse(false))
+        .map(ConsumerGroupListing::groupId)
+        .filter(id -> isSseConsumerGroup(id, topic))
+        .toList();
   }
 
   private static CompletionStage<Boolean> evictExtraMembers(
@@ -200,7 +237,7 @@ public class Server {
         .filter(consumerGroupId::equals)
         .map(
             id ->
-                evictExtraMembers(consumerGroupId, admin)
+                evictExtraMembers(id, admin)
                     .thenApply(r -> trace(r, consumerGroupId, () -> "Extra consumer group members"))
                     .thenApply(r -> message)
                     .toCompletableFuture()
@@ -317,6 +354,14 @@ public class Server {
     return state == DEAD || state == EMPTY || state == UNKNOWN;
   }
 
+  private static boolean isSseConsumerGroup(final String groupId, final String topic) {
+    final int index = groupId.indexOf(topic);
+
+    return index != -1
+        && groupId.substring(0, index).endsWith("-")
+        && INDEX_SUFFIX.matcher(groupId.substring(index + topic.length())).matches();
+  }
+
   private static CompletionStage<Map<TopicPartition, OffsetAndMetadata>> latestOffsets(
       final String username, final String topic, final Admin admin) {
     return existingConsumerGroups(username, topic, admin)
@@ -352,6 +397,12 @@ public class Server {
                                 () -> new OffsetAndMetadata(topicOffsets.get(e.getKey()))))));
   }
 
+  private static Collection<String> logDeleteConsumerGroups(final Collection<String> groupIds) {
+    groupIds.forEach(id -> LOGGER.info(() -> "Deleting consumer group " + id));
+
+    return groupIds;
+  }
+
   private static Collection<MemberToRemove> membersToRemove(
       final Collection<String> groupInstanceIds) {
     return groupInstanceIds.stream().map(MemberToRemove::new).toList();
@@ -364,6 +415,21 @@ public class Server {
   private static KafkaProducer<String, JsonObject> producer(final Config config) {
     return createReliableProducer(
         fromConfig(config, KAFKA), new StringSerializer(), new JsonSerializer());
+  }
+
+  private static CompletionStage<Void> runCleanUpSseConsumerGroups(
+      final String topic, final Admin admin, final State<Boolean> stop) {
+    return composeAsyncAfter(
+            () ->
+                FALSE.equals(stop.get())
+                    ? cleanUpConsumerGroups(topic, admin)
+                    : completedFuture(null),
+            CLEAN_UP_INTERVAL)
+        .thenComposeAsync(
+            v ->
+                FALSE.equals(stop.get())
+                    ? runCleanUpSseConsumerGroups(topic, admin, stop)
+                    : completedFuture(null));
   }
 
   private static Set<String> selectActiveConsumerGroups(
@@ -402,9 +468,7 @@ public class Server {
   }
 
   @SuppressWarnings("java:S2095") // The admin must live forever.
-  private RequestHandler handler(final Config config) {
-    final Map<String, Object> kafkaConfig = fromConfig(config, KAFKA);
-    final Admin admin = Admin.create(adminConfig(kafkaConfig));
+  private RequestHandler handler() {
     final Function<String, KafkaConsumer<String, JsonObject>> consumer =
         consumer(randomUUID().toString(), kafkaConfig);
     final String topic = config.getString(TOPIC);
@@ -436,7 +500,17 @@ public class Server {
   }
 
   public CompletionStage<Boolean> run() {
-    return httpServer.run();
+    final State<Boolean> stop = new State<>(false);
+
+    startCleanUpSseConsumerGroups(stop);
+
+    return httpServer
+        .run()
+        .thenApply(
+            r -> {
+              stop.set(true);
+              return r;
+            });
   }
 
   private Publisher<ByteBuf> sseStream(
@@ -492,7 +566,12 @@ public class Server {
   }
 
   public void start() {
+    startCleanUpSseConsumerGroups(new State<>(false));
     httpServer.start();
+  }
+
+  private void startCleanUpSseConsumerGroups(final State<Boolean> stop) {
+    runCleanUpSseConsumerGroups(config.getString(TOPIC), admin, stop);
   }
 
   public Server withConfig(final Config config) {

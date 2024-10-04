@@ -71,6 +71,7 @@ class TestServer {
   private static final String BOOTSTRAP_SERVER = "localhost:9092";
   private static final Map<String, Object> COMMON_CONFIG =
       map(pair(BOOTSTRAP_SERVERS_CONFIG, BOOTSTRAP_SERVER));
+  private static final String TOPIC = randomUUID().toString();
   private static final String USERNAME = "username";
   private static final String USER_PREFIX = "user";
   private static final String VALUE = "value";
@@ -79,22 +80,21 @@ class TestServer {
   private static final HttpClient client = newBuilder().version(HTTP_1_1).build();
   private static final Map<String, byte[]> resources = new HashMap<>();
   private static final Signer signer = new Signer(readKey("rsa.priv"));
-  private static final String topic = randomUUID().toString();
   private static final URI uri = URI.create("http://localhost:9000");
 
   @AfterAll
   static void afterAll() {
-    deleteTopics(set(topic), admin).toCompletableFuture().join();
+    deleteTopics(set(TOPIC), admin).toCompletableFuture().join();
   }
 
   @BeforeAll
   static void beforeAll() {
-    createTopics(set(newTopic(topic)), admin).toCompletableFuture().join();
+    createTopics(set(newTopic(TOPIC)), admin).toCompletableFuture().join();
   }
 
   private static Config config() {
     return defaultApplication()
-        .withValue("topic", fromAnyRef(topic))
+        .withValue("topic", fromAnyRef(TOPIC))
         .withValue("jwtPublicKey", fromAnyRef(readKey("rsa.pub")))
         .withValue("usernameField", fromAnyRef(USERNAME))
         .withValue("abandonedMessageLag", fromAnyRef(-1))
@@ -103,7 +103,7 @@ class TestServer {
 
   private static Map<String, CompletableFuture<Void>> getReady(final int numberOfUsers) {
     return usernames(numberOfUsers)
-        .map(u -> u + "-" + topic + "-0")
+        .map(u -> u + "-" + TOPIC + "-0")
         .collect(toMap(u -> u, u -> new CompletableFuture<>()));
   }
 
@@ -190,7 +190,7 @@ class TestServer {
               send(
                   p,
                   new ProducerRecord<>(
-                      topic,
+                      TOPIC,
                       randomUUID().toString(),
                       o(f(USERNAME, v(USER_PREFIX + j)), f(VALUE, v(i)))));
             }
@@ -200,7 +200,7 @@ class TestServer {
 
   private static Server startServer(final Map<String, CompletableFuture<Void>> ready) {
     final Collection<TopicPartition> partitions =
-        topicPartitions(topic, admin).toCompletableFuture().join();
+        topicPartitions(TOPIC, admin).toCompletableFuture().join();
     final Server server =
         new Server()
             .withEventHandler(

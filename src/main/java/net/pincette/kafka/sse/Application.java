@@ -12,7 +12,7 @@ import java.util.logging.Logger;
 
 public class Application {
   static final Logger LOGGER = getLogger("net.pincette.kafka.sse");
-  private static final String VERSION = "1.0.0";
+  private static final String VERSION = "1.0.1";
 
   @SuppressWarnings("java:S106") // Not logging
   public static void main(final String[] args) {
