@@ -104,6 +104,7 @@ import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 
 public class Server {
+  private static final String ACCESS_TOKEN = "access_token";
   private static final Duration CLEAN_UP_INTERVAL = ofSeconds(60);
   private static final String CONSUMER_GPOUP_ID = "consumerGroupId";
   private static final String DEFAULT_EVENT_NAME = "message";
@@ -111,6 +112,7 @@ public class Server {
   private static final String DEFAULT_USERNAME_FIELD = "_jwt.sub";
   private static final String EVENT_NAME = "eventName";
   private static final String EVENT_NAME_FIELD = "eventNameField";
+  private static final String FALLBACK_COOKIE = "fallbackCookie";
   private static final String INSTANCE_ENV = "INSTANCE";
   private static final Pattern INDEX_SUFFIX = compile("-\\d+");
   private static final String JWT_PUBLIC_KEY = "jwtPublicKey";
@@ -304,8 +306,9 @@ public class Server {
     return json -> getString(json, pointer).orElse(defaultName);
   }
 
-  private static Optional<String> getUsername(final HttpRequest request) {
-    return getBearerToken(request)
+  private static Optional<String> getUsername(
+      final HttpRequest request, final String fallbackCookie) {
+    return getBearerToken(request, fallbackCookie)
         .flatMap(net.pincette.jwt.Util::getJwtPayload)
         .flatMap(p -> getString(p, "/" + SUB))
         .map(
@@ -471,10 +474,12 @@ public class Server {
   private RequestHandler handler() {
     final Function<String, KafkaConsumer<String, JsonObject>> consumer =
         consumer(randomUUID().toString(), kafkaConfig);
+    final String fallbackCookie =
+        tryToGetSilent(() -> config.getString(FALLBACK_COOKIE)).orElse(ACCESS_TOKEN);
     final String topic = config.getString(TOPIC);
 
     return (request, requestBody, response) ->
-        getUsername(request)
+        getUsername(request, fallbackCookie)
             .map(
                 u ->
                     getConsumerGroup(u, topic, admin, 0)

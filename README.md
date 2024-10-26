@@ -14,13 +14,15 @@ The configuration is managed by the [Lightbend Config package](https://github.co
 |---|---|---|
 |eventName|No|The name that is given to the SSE-events. The default value is `message`.|
 |eventNameField|No|The name of the field in the events that is used to extract the name for the SSE-event. If it is not set, then it falls back to the `eventName` field.|
+|fallbackCookie|No|The cookie that is consumed when no bearer token could be found on the `Authorization` header. If you rely on this, then make sure the cookie is an `HttpOnly` cookie. The default value is `access_token`.|
+|jwtPublicKey|No|A public key in PEM format. If it is present, the signature of the bearer tokens will be verified. If you don't use it, you should deploy the server behind a gateway that does the verification.|
 |kafka|Yes|All Kafka settings come below this entry. So for example, the setting `bootstrap.servers` would go to the entry `kafka.bootstrap.servers`.|
 |topic|Yes|The Kafka topic that is consumed.|
 |usernameField|No|The name of the field in the events that is used to extract the user name. The default value is `_jwt.sub`.|
 
 ## Building and Running
 
-You can build the tool with `mvn clean package`. This will produce a self-contained JAR-file in the `target` directory with the form `pincette-kafka-ticker-<version>-jar-with-dependencies.jar`. You can launch this JAR with `java -jar`.
+You can build the tool with `mvn clean package`. This will produce a self-contained JAR-file in the `target` directory with the form `pincette-kafka-sse-<version>-jar-with-dependencies.jar`. You can launch this JAR with `java -jar`.
 
 ## Docker
 
