@@ -31,6 +31,7 @@ import static net.pincette.json.JsonUtil.getString;
 import static net.pincette.json.JsonUtil.string;
 import static net.pincette.json.JsonUtil.toJsonPointer;
 import static net.pincette.kafka.sse.Application.LOGGER;
+import static net.pincette.netty.http.JWTVerifier.verify;
 import static net.pincette.netty.http.PipelineHandler.handle;
 import static net.pincette.netty.http.Util.getBearerToken;
 import static net.pincette.netty.http.Util.simpleResponse;
@@ -80,7 +81,6 @@ import net.pincette.kafka.json.JsonDeserializer;
 import net.pincette.kafka.json.JsonSerializer;
 import net.pincette.netty.http.HeaderHandler;
 import net.pincette.netty.http.HttpServer;
-import net.pincette.netty.http.JWTVerifier;
 import net.pincette.netty.http.RequestHandler;
 import net.pincette.rs.Merge;
 import net.pincette.rs.Source;
@@ -278,6 +278,10 @@ public class Server {
         .toList();
   }
 
+  private static String fallbackCookie(final Config config) {
+    return tryToGetSilent(() -> config.getString(FALLBACK_COOKIE)).orElse(ACCESS_TOKEN);
+  }
+
   private static CompletionStage<String> getConsumerGroup(
       final String username, final String topic, final Admin admin, final int index) {
     final String group = groupId(username, topic, index);
@@ -344,8 +348,10 @@ public class Server {
   }
 
   private static HeaderHandler headerHandler(final Config config) {
+    final String fallbackCookie = fallbackCookie(config);
+
     return tryToGetSilent(() -> config.getString(JWT_PUBLIC_KEY))
-        .map(JWTVerifier::verify)
+        .map(key -> verify(key, fallbackCookie))
         .orElse(h -> h);
   }
 
@@ -474,8 +480,7 @@ public class Server {
   private RequestHandler handler() {
     final Function<String, KafkaConsumer<String, JsonObject>> consumer =
         consumer(randomUUID().toString(), kafkaConfig);
-    final String fallbackCookie =
-        tryToGetSilent(() -> config.getString(FALLBACK_COOKIE)).orElse(ACCESS_TOKEN);
+    final String fallbackCookie = fallbackCookie(config);
     final String topic = config.getString(TOPIC);
 
     return (request, requestBody, response) ->
