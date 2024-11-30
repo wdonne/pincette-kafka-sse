@@ -72,6 +72,7 @@ import java.util.Set;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Flow.Publisher;
 import java.util.function.BiConsumer;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
@@ -99,7 +100,9 @@ import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.ConsumerGroupState;
+import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.TimeoutException;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 
@@ -122,7 +125,8 @@ public class Server {
   private static final String TOPIC = "topic";
   private static final String USERNAME_FIELD = "usernameField";
 
-  private final Admin admin;
+  private Admin admin;
+  private final Map<String, Object> adminConfig;
   private final Config config;
   private final BiConsumer<ConsumerEvent, KafkaConsumer<String, JsonObject>> eventHandler;
   private final HttpServer httpServer;
@@ -142,7 +146,7 @@ public class Server {
             ? new HttpServer(
                 port, wrapTracing(handle(headerHandler(config)).finishWith(handler()), LOGGER))
             : null;
-    admin = kafkaConfig != null ? Admin.create(adminConfig(kafkaConfig)) : null;
+    adminConfig = kafkaConfig != null ? adminConfig(kafkaConfig) : null;
   }
 
   public Server() {
@@ -173,19 +177,30 @@ public class Server {
     return eventHandler != null ? eventHandler.andThen(check) : check;
   }
 
+  private static boolean canRetry(final Throwable t) {
+    return t.getCause() instanceof KafkaException kafkaException
+        && kafkaException.getCause() instanceof TimeoutException;
+  }
+
   private static CompletionStage<Void> cleanUpConsumerGroups(
-      final String topic, final Admin admin) {
+      final String topic, final Supplier<Admin> admin, final Consumer<Throwable> adminError) {
     return admin
+        .get()
         .listConsumerGroups()
         .all()
         .toCompletionStage()
         .thenApply(c -> emptySseConsumerGroups(c, topic))
         .thenApply(Server::logDeleteConsumerGroups)
         .thenComposeAsync(
-            groupIds -> admin.deleteConsumerGroups(groupIds).all().toCompletionStage())
+            groupIds -> admin.get().deleteConsumerGroups(groupIds).all().toCompletionStage())
         .exceptionally(
             t -> {
               LOGGER.log(SEVERE, t.getMessage(), t);
+
+              if (canRetry(t)) {
+                adminError.accept(t);
+              }
+
               return null; // By this time some groups may be active again.
             });
   }
@@ -427,17 +442,20 @@ public class Server {
   }
 
   private static CompletionStage<Void> runCleanUpSseConsumerGroups(
-      final String topic, final Admin admin, final State<Boolean> stop) {
+      final String topic,
+      final Supplier<Admin> admin,
+      final Consumer<Throwable> adminError,
+      final State<Boolean> stop) {
     return composeAsyncAfter(
             () ->
                 FALSE.equals(stop.get())
-                    ? cleanUpConsumerGroups(topic, admin)
+                    ? cleanUpConsumerGroups(topic, admin, adminError)
                     : completedFuture(null),
             CLEAN_UP_INTERVAL)
         .thenComposeAsync(
             v ->
                 FALSE.equals(stop.get())
-                    ? runCleanUpSseConsumerGroups(topic, admin, stop)
+                    ? runCleanUpSseConsumerGroups(topic, admin, adminError, stop)
                     : completedFuture(null));
   }
 
@@ -476,7 +494,14 @@ public class Server {
     httpServer.close();
   }
 
-  @SuppressWarnings("java:S2095") // The admin must live forever.
+  private Admin getAdmin() {
+    if (admin == null) {
+      admin = Admin.create(adminConfig);
+    }
+
+    return admin;
+  }
+
   private RequestHandler handler() {
     final Function<String, KafkaConsumer<String, JsonObject>> consumer =
         consumer(randomUUID().toString(), kafkaConfig);
@@ -487,11 +512,12 @@ public class Server {
         getUsername(request, fallbackCookie)
             .map(
                 u ->
-                    getConsumerGroup(u, topic, admin, 0)
+                    getConsumerGroup(u, topic, getAdmin(), 0)
                         .thenComposeAsync(
                             group ->
-                                latestOffsets(u, topic, admin)
-                                    .thenComposeAsync(latest -> goToLatest(group, latest, admin))
+                                latestOffsets(u, topic, getAdmin())
+                                    .thenComposeAsync(
+                                        latest -> goToLatest(group, latest, getAdmin()))
                                     .thenApply(latest -> group))
                         .thenComposeAsync(
                             group ->
@@ -499,9 +525,10 @@ public class Server {
                                     response,
                                     OK,
                                     MIME_TYPE,
-                                    sseStream(u, consumer, group, config, admin)))
+                                    sseStream(u, consumer, group, config, getAdmin())))
                         .exceptionally(
                             t -> {
+                              admin = null;
                               LOGGER.log(SEVERE, t.getMessage(), t);
                               response.setStatus(INTERNAL_SERVER_ERROR);
                               return messagePublisher(t.getMessage());
@@ -581,7 +608,7 @@ public class Server {
   }
 
   private void startCleanUpSseConsumerGroups(final State<Boolean> stop) {
-    runCleanUpSseConsumerGroups(config.getString(TOPIC), admin, stop);
+    runCleanUpSseConsumerGroups(config.getString(TOPIC), this::getAdmin, t -> admin = null, stop);
   }
 
   public Server withConfig(final Config config) {
