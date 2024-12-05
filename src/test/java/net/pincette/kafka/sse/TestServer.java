@@ -14,6 +14,7 @@ import static net.pincette.io.StreamConnector.copy;
 import static net.pincette.jes.util.Kafka.createReliableProducer;
 import static net.pincette.jes.util.Kafka.send;
 import static net.pincette.jes.util.Kafka.topicPartitions;
+import static net.pincette.json.Factory.a;
 import static net.pincette.json.Factory.f;
 import static net.pincette.json.Factory.o;
 import static net.pincette.json.Factory.v;
@@ -50,20 +51,28 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
+import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Stream;
+import javax.json.JsonValue;
 import net.pincette.io.DevNullInputStream;
 import net.pincette.json.JsonUtil;
 import net.pincette.jwt.Signer;
 import net.pincette.kafka.json.JsonSerializer;
+import net.pincette.util.Pair;
 import net.pincette.util.State;
 import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.ConsumerGroupDescription;
+import org.apache.kafka.clients.admin.ConsumerGroupListing;
+import org.apache.kafka.clients.admin.MemberToRemove;
 import org.apache.kafka.clients.admin.NewTopic;
+import org.apache.kafka.clients.admin.RemoveMembersFromConsumerGroupOptions;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.StringSerializer;
-import org.junit.jupiter.api.AfterAll;
-import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -71,7 +80,8 @@ class TestServer {
   private static final String BOOTSTRAP_SERVER = "localhost:9092";
   private static final Map<String, Object> COMMON_CONFIG =
       map(pair(BOOTSTRAP_SERVERS_CONFIG, BOOTSTRAP_SERVER));
-  private static final String TOPIC = randomUUID().toString();
+  private static final String SUBSCRIPTIONS = "subscriptions";
+  private static final String TOPIC = "test-sse";
   private static final String USERNAME = "username";
   private static final String USER_PREFIX = "user";
   private static final String VALUE = "value";
@@ -82,23 +92,40 @@ class TestServer {
   private static final Signer signer = new Signer(readKey("rsa.priv"));
   private static final URI uri = URI.create("http://localhost:9000");
 
-  @AfterAll
-  static void afterAll() {
-    deleteTopics(set(TOPIC), admin).toCompletableFuture().join();
-  }
-
-  @BeforeAll
-  static void beforeAll() {
-    createTopics(set(newTopic(TOPIC)), admin).toCompletableFuture().join();
-  }
-
   private static Config config() {
     return defaultApplication()
         .withValue("topic", fromAnyRef(TOPIC))
         .withValue("jwtPublicKey", fromAnyRef(readKey("rsa.pub")))
         .withValue("usernameField", fromAnyRef(USERNAME))
+        .withValue("subscriptionsField", fromAnyRef(SUBSCRIPTIONS))
         .withValue("abandonedMessageLag", fromAnyRef(-1))
         .withValue("kafka.bootstrap.servers", fromAnyRef(BOOTSTRAP_SERVER));
+  }
+
+  private static Map<String, Collection<MemberToRemove>> convertToMemberToRemove(
+      final Map<String, ConsumerGroupDescription> map) {
+    return map(
+        map.entrySet().stream()
+            .map(
+                e ->
+                    pair(
+                        e.getKey(),
+                        e.getValue().members().stream()
+                            .flatMap(member -> member.groupInstanceId().stream())
+                            .map(MemberToRemove::new)
+                            .toList())));
+  }
+
+  private static void deleteConsumerGroups() {
+    admin
+        .listConsumerGroups()
+        .all()
+        .toCompletionStage()
+        .thenApply(TestServer::selectGroupIds)
+        .thenComposeAsync(TestServer::removeConsumerGroupMembers)
+        .thenComposeAsync(groups -> admin.deleteConsumerGroups(groups).all().toCompletionStage())
+        .toCompletableFuture()
+        .join();
   }
 
   private static Map<String, CompletableFuture<Void>> getReady(final int numberOfUsers) {
@@ -146,6 +173,32 @@ class TestServer {
         .build();
   }
 
+  private static CompletionStage<Collection<String>> removeConsumerGroupMembers(
+      final Collection<String> groupIds) {
+    return admin
+        .describeConsumerGroups(groupIds)
+        .all()
+        .toCompletionStage()
+        .thenApply(TestServer::convertToMemberToRemove)
+        .thenComposeAsync(TestServer::removeConsumerGroupMembers);
+  }
+
+  private static CompletionStage<Collection<String>> removeConsumerGroupMembers(
+      final Map<String, Collection<MemberToRemove>> toRemove) {
+    return allOf(
+            toRemove.entrySet().stream()
+                .map(
+                    e ->
+                        admin
+                            .removeMembersFromConsumerGroup(
+                                e.getKey(), new RemoveMembersFromConsumerGroupOptions(e.getValue()))
+                            .all()
+                            .toCompletionStage()
+                            .toCompletableFuture())
+                .toArray(CompletableFuture[]::new))
+        .thenApply(v -> toRemove.keySet());
+  }
+
   private static CompletableFuture<Void> runUser(final String username, final int maxMessages) {
     final CompletableFuture<Void> done = new CompletableFuture<>();
 
@@ -181,7 +234,17 @@ class TestServer {
     return usernames(number).map(username -> runUser(username, maxMessages));
   }
 
-  private static void sendMessages(final int numberOfUsers, final int maxMessages) {
+  private static Collection<String> selectGroupIds(final Collection<ConsumerGroupListing> groups) {
+    return groups.stream()
+        .map(ConsumerGroupListing::groupId)
+        .filter(s -> s.contains("-" + TOPIC + "-"))
+        .toList();
+  }
+
+  private static void sendMessages(
+      final int numberOfUsers,
+      final int maxMessages,
+      final Function<String, Pair<String, JsonValue>> user) {
     tryToDoWithRethrow(
         () -> createReliableProducer(COMMON_CONFIG, new StringSerializer(), new JsonSerializer()),
         p -> {
@@ -192,7 +255,7 @@ class TestServer {
                   new ProducerRecord<>(
                       TOPIC,
                       randomUUID().toString(),
-                      o(f(USERNAME, v(USER_PREFIX + j)), f(VALUE, v(i)))));
+                      o(user.apply(USER_PREFIX + j), f(VALUE, v(i)))));
             }
           }
         });
@@ -221,8 +284,28 @@ class TestServer {
     return server;
   }
 
+  private static Pair<String, JsonValue> subscription(final String username) {
+    return f(SUBSCRIPTIONS, a(v(username)));
+  }
+
+  private static void test(
+      final Function<String, Pair<String, JsonValue>> user, final int messages, final int users) {
+    final Map<String, CompletableFuture<Void>> ready = getReady(users);
+    final Server server = startServer(ready);
+    final List<CompletableFuture<Void>> running = runUsers(users, messages).toList();
+
+    allOf(ready.values().toArray(CompletableFuture[]::new)).join();
+    sendMessages(users, messages, user);
+    allOf(running.toArray(CompletableFuture[]::new)).join();
+    server.close();
+  }
+
   private static String token(final String username) {
     return signer.sign(JWT.create().withSubject(username).withExpiresAt(now().plusSeconds(3600)));
+  }
+
+  private static Pair<String, JsonValue> username(final String username) {
+    return f(USERNAME, v(username));
   }
 
   private static Stream<String> usernames(final int numberOfUsers) {
@@ -236,18 +319,27 @@ class TestServer {
         .orElse(-1);
   }
 
-  @Test
-  @DisplayName("test")
-  void test() {
-    final int messages = 100;
-    final int users = 100;
-    final Map<String, CompletableFuture<Void>> ready = getReady(users);
-    final Server server = startServer(ready);
-    final List<CompletableFuture<Void>> running = runUsers(users, messages).toList();
+  @AfterEach
+  void afterEach() {
+    deleteTopics(set(TOPIC), admin).toCompletableFuture().join();
+    deleteConsumerGroups();
+  }
 
-    allOf(ready.values().toArray(CompletableFuture[]::new)).join();
-    sendMessages(users, messages);
-    allOf(running.toArray(CompletableFuture[]::new)).join();
-    server.close();
+  @BeforeEach
+  void beforeEach() {
+    afterEach();
+    createTopics(set(newTopic(TOPIC)), admin).toCompletableFuture().join();
+  }
+
+  @Test
+  @DisplayName("test subscriptions")
+  void testSubscriptions() {
+    test(TestServer::subscription, 10, 10);
+  }
+
+  @Test
+  @DisplayName("test username")
+  void testUsername() {
+    test(TestServer::username, 100, 100);
   }
 }

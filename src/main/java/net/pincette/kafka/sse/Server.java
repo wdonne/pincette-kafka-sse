@@ -17,7 +17,10 @@ import static java.util.regex.Pattern.compile;
 import static java.util.stream.Collectors.groupingBy;
 import static java.util.stream.Collectors.maxBy;
 import static java.util.stream.Collectors.toSet;
+import static net.pincette.config.Util.configValue;
+import static net.pincette.jes.JsonFields.JWT;
 import static net.pincette.jes.JsonFields.SUB;
+import static net.pincette.jes.JsonFields.SUBSCRIPTIONS;
 import static net.pincette.jes.util.Kafka.adminConfig;
 import static net.pincette.jes.util.Kafka.consumerGroupOffsets;
 import static net.pincette.jes.util.Kafka.createReliableProducer;
@@ -27,6 +30,7 @@ import static net.pincette.jes.util.Kafka.send;
 import static net.pincette.jes.util.Kafka.topicPartitionOffsets;
 import static net.pincette.jes.util.Kafka.topicPartitions;
 import static net.pincette.json.JsonUtil.createObjectBuilder;
+import static net.pincette.json.JsonUtil.getArray;
 import static net.pincette.json.JsonUtil.getString;
 import static net.pincette.json.JsonUtil.string;
 import static net.pincette.json.JsonUtil.toJsonPointer;
@@ -76,6 +80,7 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
 import javax.json.JsonObject;
 import net.pincette.json.JsonUtil;
 import net.pincette.kafka.json.JsonDeserializer;
@@ -112,7 +117,8 @@ public class Server {
   private static final String CONSUMER_GPOUP_ID = "consumerGroupId";
   private static final String DEFAULT_EVENT_NAME = "message";
   private static final String DEFAULT_INSTANCE = randomUUID().toString();
-  private static final String DEFAULT_USERNAME_FIELD = "_jwt.sub";
+  private static final String DEFAULT_SUBSCRIPTIONS_FIELD = SUBSCRIPTIONS;
+  private static final String DEFAULT_USERNAME_FIELD = JWT + "." + SUB;
   private static final String EVENT_NAME = "eventName";
   private static final String EVENT_NAME_FIELD = "eventNameField";
   private static final String FALLBACK_COOKIE = "fallbackCookie";
@@ -122,6 +128,7 @@ public class Server {
   private static final String KAFKA = "kafka";
   private static final int MAX_EXISTING_CONSUMER_GROUPS = 10;
   private static final String MIME_TYPE = "text/event-stream";
+  private static final String SUBSCRIPTIONS_FIELD = "subscriptionsField";
   private static final String TOPIC = "topic";
   private static final String USERNAME_FIELD = "usernameField";
 
@@ -325,6 +332,17 @@ public class Server {
     return json -> getString(json, pointer).orElse(defaultName);
   }
 
+  private static Function<JsonObject, Stream<String>> getSubscriptions(final Config config) {
+    final String field = getSubscriptionsField(config);
+
+    return json -> getArray(json, field).map(JsonUtil::strings).orElseGet(Stream::empty);
+  }
+
+  private static String getSubscriptionsField(final Config config) {
+    return toJsonPointer(
+        configValue(config::getString, SUBSCRIPTIONS_FIELD).orElse(DEFAULT_SUBSCRIPTIONS_FIELD));
+  }
+
   private static Optional<String> getUsername(
       final HttpRequest request, final String fallbackCookie) {
     return getBearerToken(request, fallbackCookie)
@@ -345,7 +363,7 @@ public class Server {
 
   private static String getUsernameField(final Config config) {
     return toJsonPointer(
-        tryToGetSilent(() -> config.getString(USERNAME_FIELD)).orElse(DEFAULT_USERNAME_FIELD));
+        configValue(config::getString, USERNAME_FIELD).orElse(DEFAULT_USERNAME_FIELD));
   }
 
   private static CompletionStage<Void> goToLatest(
@@ -557,8 +575,9 @@ public class Server {
       final Config config,
       final Admin admin) {
     final State<Boolean> completed = new State<>(false);
-    final Function<JsonObject, String> getUsername = getUsername(config);
     final Function<JsonObject, String> getEventName = getEventName(config);
+    final Function<JsonObject, Stream<String>> getSubscriptions = getSubscriptions(config);
+    final Function<JsonObject, String> getUsername = getUsername(config);
     final String topic = config.getString(TOPIC);
     final KafkaPublisher<String, JsonObject> source =
         new KafkaPublisher<String, JsonObject>()
@@ -584,15 +603,13 @@ public class Server {
                         evictExtraMembersIfRace(
                             trace(json, consumerGroupId), consumerGroupId, admin))
                 .filter(json -> !json.containsKey(CONSUMER_GPOUP_ID))
-                .map(json -> pair(json, getUsername.apply(json)))
-                .filter(pair -> username.equals(pair.second))
+                .filter(
+                    json ->
+                        username.equals(getUsername.apply(json))
+                            || getSubscriptions.apply(json).anyMatch(s -> s.equals(username)))
                 .map(
-                    pair ->
-                        "event: "
-                            + getEventName.apply(pair.first)
-                            + "\ndata: "
-                            + string(pair.first)
-                            + "\n\n")
+                    json ->
+                        "event: " + getEventName.apply(json) + "\ndata: " + string(json) + "\n\n")
                 .get(),
             with(generate(() -> ":\n")).throttle(1).get()))
         .buffer(100, ofSeconds(1))

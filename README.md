@@ -17,6 +17,7 @@ The configuration is managed by the [Lightbend Config package](https://github.co
 |fallbackCookie|No|The cookie that is consumed when no bearer token could be found on the `Authorization` header. If you rely on this, then make sure the cookie is an `HttpOnly` cookie. The default value is `access_token`.|
 |jwtPublicKey|No|A public key in PEM format. If it is present, the signature of the bearer tokens will be verified. If you don't use it, you should deploy the server behind a gateway that does the verification.|
 |kafka|Yes|All Kafka settings come below this entry. So for example, the setting `bootstrap.servers` would go to the entry `kafka.bootstrap.servers`.|
+|subscriptionsField|No|The name of the field in the events that is used to extract the subscriptions. It should be an array of strings. If the username of the current user is in it, the event will also be sent there. The default value is `_subscriptions`.|
 |topic|Yes|The Kafka topic that is consumed.|
 |usernameField|No|The name of the field in the events that is used to extract the user name. The default value is `_jwt.sub`.|
 
