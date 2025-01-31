@@ -17,9 +17,37 @@ The configuration is managed by the [Lightbend Config package](https://github.co
 |fallbackCookie|No|The cookie that is consumed when no bearer token could be found on the `Authorization` header. If you rely on this, then make sure the cookie is an `HttpOnly` cookie. The default value is `access_token`.|
 |jwtPublicKey|No|A public key in PEM format. If it is present, the signature of the bearer tokens will be verified. If you don't use it, you should deploy the server behind a gateway that does the verification.|
 |kafka|Yes|All Kafka settings come below this entry. So for example, the setting `bootstrap.servers` would go to the entry `kafka.bootstrap.servers`.|
+|namespace|No|A name to distinguish several deployments in the same environment. The default value is `sse`.|
+|otlp.grpc|No|The OpenTelemetry endpoint for logs and metrics. It should be a URL like `http://localhost:4317`.|
 |subscriptionsField|No|The name of the field in the events that is used to extract the subscriptions. It should be an array of strings. If the username of the current user is in it, the event will also be sent there. The default value is `_subscriptions`.|
 |topic|Yes|The Kafka topic that is consumed.|
+|tracesTopic|No|The Kafka topic to which the event traces are sent.|
 |usernameField|No|The name of the field in the events that is used to extract the user name. The default value is `_jwt.sub`.|
+
+## Telemetry
+
+A few OpenTelemetry observable counters are emitted every minute. The following table shows the counters.
+
+|Counter|Description|
+|---|---|
+|http.server.average_duration_millis|The average request duration in the measured interval.|
+|http.server.average_request_bytes|The average request body size in bytes in the measured interval.|
+|http.server.average_response_bytes|The average response body size in bytes in the measured interval.|
+|http.server.sse_events|The number of SSE events that are sent to clients during the measured interval.|
+|http.server.requests|The number of requests during the measured interval.|
+
+The following attributes are added to the counters, except for the counter `http.server.sse_events`, which has only the attribute `instance`.
+
+|Attribute|Description|
+|---|---|
+|aggregate|The name of the aggregate the request was about.|
+|http.request.method|The request method.|
+|http.response.status_code|The status code of the response.|
+|instance|The UUID of the Kafka SSE instance.|
+
+The logs are also sent to the OpenTelemetry endpoint.
+
+The event traces are JSON messages, as described in [JSON Streams Telemetry](https://jsonstreams.io/docs/logging.html). They are sent to the Kafka topic set in the `tracesTopic` configuration field.
 
 ## Building and Running
 

@@ -4,10 +4,12 @@ import static io.netty.buffer.Unpooled.wrappedBuffer;
 import static io.netty.handler.codec.http.HttpResponseStatus.INTERNAL_SERVER_ERROR;
 import static io.netty.handler.codec.http.HttpResponseStatus.OK;
 import static io.netty.handler.codec.http.HttpResponseStatus.UNAUTHORIZED;
+import static io.opentelemetry.api.common.AttributeKey.stringKey;
 import static java.lang.Boolean.FALSE;
 import static java.lang.System.getenv;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.time.Duration.ofSeconds;
+import static java.time.Instant.now;
 import static java.util.Comparator.comparingLong;
 import static java.util.Optional.ofNullable;
 import static java.util.UUID.randomUUID;
@@ -18,9 +20,12 @@ import static java.util.stream.Collectors.groupingBy;
 import static java.util.stream.Collectors.maxBy;
 import static java.util.stream.Collectors.toSet;
 import static net.pincette.config.Util.configValue;
+import static net.pincette.jes.JsonFields.CORR;
 import static net.pincette.jes.JsonFields.JWT;
 import static net.pincette.jes.JsonFields.SUB;
 import static net.pincette.jes.JsonFields.SUBSCRIPTIONS;
+import static net.pincette.jes.tel.OtelUtil.metrics;
+import static net.pincette.jes.tel.OtelUtil.resettingCounter;
 import static net.pincette.jes.util.Kafka.adminConfig;
 import static net.pincette.jes.util.Kafka.consumerGroupOffsets;
 import static net.pincette.jes.util.Kafka.createReliableProducer;
@@ -34,13 +39,18 @@ import static net.pincette.json.JsonUtil.getArray;
 import static net.pincette.json.JsonUtil.getString;
 import static net.pincette.json.JsonUtil.string;
 import static net.pincette.json.JsonUtil.toJsonPointer;
-import static net.pincette.kafka.sse.Application.LOGGER;
+import static net.pincette.kafka.sse.Common.LOGGER;
+import static net.pincette.kafka.sse.Common.SSE;
+import static net.pincette.kafka.sse.Common.VERSION;
+import static net.pincette.kafka.sse.Common.namespace;
 import static net.pincette.netty.http.JWTVerifier.verify;
 import static net.pincette.netty.http.PipelineHandler.handle;
 import static net.pincette.netty.http.Util.getBearerToken;
 import static net.pincette.netty.http.Util.simpleResponse;
+import static net.pincette.netty.http.Util.wrapMetrics;
 import static net.pincette.netty.http.Util.wrapTracing;
 import static net.pincette.rs.Chain.with;
+import static net.pincette.rs.Probe.probeValue;
 import static net.pincette.rs.Util.empty;
 import static net.pincette.rs.Util.generate;
 import static net.pincette.rs.kafka.ConsumerEvent.STARTED;
@@ -51,6 +61,7 @@ import static net.pincette.util.Pair.pair;
 import static net.pincette.util.ScheduledCompletionStage.composeAsyncAfter;
 import static net.pincette.util.StreamUtil.rangeExclusive;
 import static net.pincette.util.StreamUtil.tail;
+import static net.pincette.util.Util.tryToDoSilent;
 import static net.pincette.util.Util.tryToDoWithRethrow;
 import static net.pincette.util.Util.tryToGetSilent;
 import static org.apache.kafka.clients.CommonClientConfigs.GROUP_ID_CONFIG;
@@ -66,15 +77,21 @@ import com.typesafe.config.Config;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.handler.codec.http.HttpRequest;
+import io.opentelemetry.api.OpenTelemetry;
+import io.opentelemetry.api.common.Attributes;
+import java.io.Closeable;
 import java.time.Duration;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.Flow.Processor;
 import java.util.concurrent.Flow.Publisher;
+import java.util.concurrent.Flow.Subscriber;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -82,13 +99,17 @@ import java.util.function.Supplier;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
 import javax.json.JsonObject;
+import net.pincette.jes.tel.EventTrace;
+import net.pincette.jes.tel.HttpMetrics;
 import net.pincette.json.JsonUtil;
 import net.pincette.kafka.json.JsonDeserializer;
 import net.pincette.kafka.json.JsonSerializer;
 import net.pincette.netty.http.HeaderHandler;
 import net.pincette.netty.http.HttpServer;
+import net.pincette.netty.http.Metrics;
 import net.pincette.netty.http.RequestHandler;
 import net.pincette.rs.Merge;
+import net.pincette.rs.PassThrough;
 import net.pincette.rs.Source;
 import net.pincette.rs.kafka.ConsumerEvent;
 import net.pincette.rs.kafka.KafkaPublisher;
@@ -103,6 +124,7 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.ConsumerGroupState;
 import org.apache.kafka.common.KafkaException;
@@ -111,17 +133,18 @@ import org.apache.kafka.common.errors.TimeoutException;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 
-public class Server {
+public class Server implements Closeable {
   private static final String ACCESS_TOKEN = "access_token";
   private static final Duration CLEAN_UP_INTERVAL = ofSeconds(60);
   private static final String CONSUMER_GPOUP_ID = "consumerGroupId";
   private static final String DEFAULT_EVENT_NAME = "message";
-  private static final String DEFAULT_INSTANCE = randomUUID().toString();
   private static final String DEFAULT_SUBSCRIPTIONS_FIELD = SUBSCRIPTIONS;
   private static final String DEFAULT_USERNAME_FIELD = JWT + "." + SUB;
   private static final String EVENT_NAME = "eventName";
   private static final String EVENT_NAME_FIELD = "eventNameField";
   private static final String FALLBACK_COOKIE = "fallbackCookie";
+  private static final String HTTP_SERVER_SSE_EVENTS = "http.server.sse_events";
+  private static final String INSTANCE_ATTRIBUTE = "instance";
   private static final String INSTANCE_ENV = "INSTANCE";
   private static final Pattern INDEX_SUFFIX = compile("-\\d+");
   private static final String JWT_PUBLIC_KEY = "jwtPublicKey";
@@ -130,15 +153,23 @@ public class Server {
   private static final String MIME_TYPE = "text/event-stream";
   private static final String SUBSCRIPTIONS_FIELD = "subscriptionsField";
   private static final String TOPIC = "topic";
+  private static final String TRACES_TOPIC = "tracesTopic";
   private static final String USERNAME_FIELD = "usernameField";
 
   private Admin admin;
   private final Map<String, Object> adminConfig;
   private final Config config;
+  private final Set<AutoCloseable> eventCounters = new HashSet<>();
   private final BiConsumer<ConsumerEvent, KafkaConsumer<String, JsonObject>> eventHandler;
-  private final HttpServer httpServer;
+  private final EventTrace eventTrace;
+  private HttpServer httpServer;
+  private final String instance = ofNullable(getenv(INSTANCE_ENV)).orElse(randomUUID().toString());
+  private final Attributes attributes = Attributes.of(stringKey(INSTANCE_ATTRIBUTE), instance);
+  private final Map<String, String> attributesMap = map(pair(INSTANCE_ATTRIBUTE, instance));
   private final Map<String, Object> kafkaConfig;
+  private OpenTelemetry metrics;
   private final int port;
+  private Producer<String, JsonObject> producer;
 
   private Server(
       final int port,
@@ -148,40 +179,19 @@ public class Server {
     this.config = config;
     this.eventHandler = eventHandler;
     kafkaConfig = config != null ? fromConfig(config, KAFKA) : null;
-    httpServer =
-        port != -1 && config != null
-            ? new HttpServer(
-                port, wrapTracing(handle(headerHandler(config)).finishWith(handler()), LOGGER))
-            : null;
     adminConfig = kafkaConfig != null ? adminConfig(kafkaConfig) : null;
+    eventTrace =
+        config != null
+            ? new EventTrace()
+                .withServiceNamespace(namespace(config))
+                .withServiceName(SSE)
+                .withServiceVersion(VERSION)
+                .withName(SSE)
+            : null;
   }
 
   public Server() {
     this(-1, null, null);
-  }
-
-  private static BiConsumer<ConsumerEvent, KafkaConsumer<String, JsonObject>> addRaceCheck(
-      final BiConsumer<ConsumerEvent, KafkaConsumer<String, JsonObject>> eventHandler,
-      final String consumerGroupId,
-      final Config config) {
-    final BiConsumer<ConsumerEvent, KafkaConsumer<String, JsonObject>> check =
-        (event, consumer) -> {
-          if (event == STARTED) {
-            tryToDoWithRethrow(
-                () -> producer(config),
-                producer ->
-                    send(
-                            producer,
-                            new ProducerRecord<>(
-                                config.getString(TOPIC),
-                                "0", // The consuming group member will always be the same.
-                                trace(createRaceCheckMessage(consumerGroupId), consumerGroupId)))
-                        .toCompletableFuture()
-                        .get());
-          }
-        };
-
-    return eventHandler != null ? eventHandler.andThen(check) : check;
   }
 
   private static boolean canRetry(final Throwable t) {
@@ -239,57 +249,10 @@ public class Server {
         .toList();
   }
 
-  private static CompletionStage<Boolean> evictExtraMembers(
-      final String consumerGroupId, final Admin admin) {
-    return extraMembers(consumerGroupId, admin)
-        .thenComposeAsync(
-            members ->
-                members.isEmpty()
-                    ? completedFuture(false)
-                    : admin
-                        .removeMembersFromConsumerGroup(
-                            consumerGroupId,
-                            new RemoveMembersFromConsumerGroupOptions(membersToRemove(members)))
-                        .all()
-                        .thenApply(v -> true)
-                        .toCompletionStage());
-  }
-
-  private static JsonObject evictExtraMembersIfRace(
-      final JsonObject message, final String consumerGroupId, final Admin admin) {
-    return ofNullable(message.getString(CONSUMER_GPOUP_ID, null))
-        .filter(consumerGroupId::equals)
-        .map(
-            id ->
-                evictExtraMembers(id, admin)
-                    .thenApply(r -> trace(r, consumerGroupId, () -> "Extra consumer group members"))
-                    .thenApply(r -> message)
-                    .toCompletableFuture()
-                    .join())
-        .orElse(message);
-  }
-
-  private static CompletionStage<Set<String>> existingConsumerGroups(
-      final String username, final String topic, final Admin admin) {
-    return describeConsumerGroups(existingConsumerGroupsIds(username, topic), admin)
-        .thenApply(Server::selectActiveConsumerGroups)
-        .thenApply(groups -> trace(groups, () -> "Existing consumer groups"));
-  }
-
   private static Set<String> existingConsumerGroupsIds(final String username, final String topic) {
     return rangeExclusive(0, MAX_EXISTING_CONSUMER_GROUPS)
         .map(i -> groupId(username, topic, i))
         .collect(toSet());
-  }
-
-  private static CompletionStage<Collection<String>> extraMembers(
-      final String consumerGroupId, final Admin admin) {
-    return describeConsumerGroups(set(consumerGroupId), admin)
-        .thenApply(
-            map ->
-                extraMembers(
-                    trace(
-                        map.get(consumerGroupId).members(), consumerGroupId, () -> "All members")));
   }
 
   private static Collection<String> extraMembers(final Collection<MemberDescription> members) {
@@ -302,18 +265,6 @@ public class Server {
 
   private static String fallbackCookie(final Config config) {
     return tryToGetSilent(() -> config.getString(FALLBACK_COOKIE)).orElse(ACCESS_TOKEN);
-  }
-
-  private static CompletionStage<String> getConsumerGroup(
-      final String username, final String topic, final Admin admin, final int index) {
-    final String group = groupId(username, topic, index);
-
-    return describeConsumerGroups(set(group), admin)
-        .thenComposeAsync(
-            map ->
-                map.isEmpty() || isFree(map.get(group).state())
-                    ? completedFuture(trace(group, group, () -> "Didn't exist yet or was free"))
-                    : getConsumerGroup(username, topic, admin, index + 1));
   }
 
   private static Function<JsonObject, String> getEventName(final Config config) {
@@ -388,10 +339,6 @@ public class Server {
         .orElse(h -> h);
   }
 
-  private static String instance() {
-    return ofNullable(getenv(INSTANCE_ENV)).orElse(DEFAULT_INSTANCE);
-  }
-
   private static boolean isFree(final ConsumerGroupState state) {
     return state == DEAD || state == EMPTY || state == UNKNOWN;
   }
@@ -402,20 +349,6 @@ public class Server {
     return index != -1
         && groupId.substring(0, index).endsWith("-")
         && INDEX_SUFFIX.matcher(groupId.substring(index + topic.length())).matches();
-  }
-
-  private static CompletionStage<Map<TopicPartition, OffsetAndMetadata>> latestOffsets(
-      final String username, final String topic, final Admin admin) {
-    return existingConsumerGroups(username, topic, admin)
-        .thenComposeAsync(groups -> topicPartitions(topic, admin).thenApply(p -> pair(groups, p)))
-        .thenComposeAsync(
-            pair ->
-                topicPartitionOffsets(pair.second, admin)
-                    .thenComposeAsync(
-                        topicOffsets ->
-                            consumerGroupOffsets(pair.first, pair.second, admin)
-                                .thenApply(
-                                    groupOffsets -> latestOffsets(groupOffsets, topicOffsets))));
   }
 
   private static Map<TopicPartition, OffsetAndMetadata> latestOffsets(
@@ -454,6 +387,11 @@ public class Server {
     return Source.of(wrappedBuffer(message.getBytes(UTF_8)));
   }
 
+  private static Subscriber<Metrics> metricsSubscriber(
+      final OpenTelemetry metrics, final String instance) {
+    return HttpMetrics.subscriber(metrics.getMeter(SSE), path -> null, instance);
+  }
+
   private static KafkaProducer<String, JsonObject> producer(final Config config) {
     return createReliableProducer(
         fromConfig(config, KAFKA), new StringSerializer(), new JsonSerializer());
@@ -485,31 +423,122 @@ public class Server {
         .collect(toSet());
   }
 
-  private static <T> T trace(final T v, final Supplier<String> message) {
-    trace(v, null, message);
+  private BiConsumer<ConsumerEvent, KafkaConsumer<String, JsonObject>> addRaceCheck(
+      final BiConsumer<ConsumerEvent, KafkaConsumer<String, JsonObject>> eventHandler,
+      final String consumerGroupId) {
+    final BiConsumer<ConsumerEvent, KafkaConsumer<String, JsonObject>> check =
+        (event, consumer) -> {
+          if (event == STARTED) {
+            tryToDoWithRethrow(
+                () -> producer(config),
+                p ->
+                    send(
+                            p,
+                            new ProducerRecord<>(
+                                config.getString(TOPIC),
+                                "0", // The consuming group member will always be the same.
+                                trace(createRaceCheckMessage(consumerGroupId), consumerGroupId)))
+                        .toCompletableFuture()
+                        .get());
+          }
+        };
 
-    return v;
-  }
-
-  private static <T> T trace(final T v, final String consumerGroupId) {
-    return trace(v, consumerGroupId, null);
-  }
-
-  private static <T> T trace(
-      final T v, final String consumerGroupId, final Supplier<String> message) {
-    LOGGER.finest(
-        () ->
-            instance()
-                + (consumerGroupId != null ? (": " + consumerGroupId) : "")
-                + ": "
-                + v.toString()
-                + (message != null ? (": " + message.get()) : ""));
-
-    return v;
+    return eventHandler != null ? eventHandler.andThen(check) : check;
   }
 
   public void close() {
+    if (producer != null) {
+      producer.close();
+    }
+
+    eventCounters.forEach(v -> tryToDoSilent(v::close));
     httpServer.close();
+  }
+
+  private void createServer() {
+    metrics = metrics(namespace(config), SSE, VERSION, config).orElse(null);
+    httpServer =
+        new HttpServer(
+            port,
+            wrapTracing(
+                handle(headerHandler(config))
+                    .finishWith(
+                        ofNullable(metrics)
+                            .map(m -> wrapMetrics(handler(), metricsSubscriber(m, instance)))
+                            .orElseGet(this::handler)),
+                LOGGER));
+
+    if (eventTrace != null) {
+      producer = producer(config);
+    }
+  }
+
+  private Processor<String, String> eventCounter() {
+    return ofNullable(metrics)
+        .map(OpenTelemetry::getMeterProvider)
+        .map(p -> p.meterBuilder(SSE).build())
+        .map(
+            m ->
+                probeValue(
+                    resettingCounter(
+                        m,
+                        HTTP_SERVER_SSE_EVENTS,
+                        (String message) -> attributes,
+                        message -> 1,
+                        eventCounters)))
+        .orElseGet(PassThrough::passThrough);
+  }
+
+  private Processor<JsonObject, JsonObject> eventTracer() {
+    return ofNullable(eventTrace)
+        .flatMap(e -> configValue(config::getString, TRACES_TOPIC))
+        .map(topic -> probeValue((JsonObject v) -> sendTrace(topic, v)))
+        .orElse(null);
+  }
+
+  private CompletionStage<Boolean> evictExtraMembers(final String consumerGroupId) {
+    return extraMembers(consumerGroupId)
+        .thenComposeAsync(
+            members ->
+                members.isEmpty()
+                    ? completedFuture(false)
+                    : admin
+                        .removeMembersFromConsumerGroup(
+                            consumerGroupId,
+                            new RemoveMembersFromConsumerGroupOptions(membersToRemove(members)))
+                        .all()
+                        .thenApply(v -> true)
+                        .toCompletionStage());
+  }
+
+  private JsonObject evictExtraMembersIfRace(
+      final JsonObject message, final String consumerGroupId) {
+    return ofNullable(message.getString(CONSUMER_GPOUP_ID, null))
+        .filter(consumerGroupId::equals)
+        .map(
+            id ->
+                evictExtraMembers(id)
+                    .thenApply(r -> trace(r, consumerGroupId, () -> "Extra consumer group members"))
+                    .thenApply(r -> message)
+                    .toCompletableFuture()
+                    .join())
+        .orElse(message);
+  }
+
+  private CompletionStage<Set<String>> existingConsumerGroups(
+      final String username, final String topic) {
+    return describeConsumerGroups(existingConsumerGroupsIds(username, topic), getAdmin())
+        .thenApply(Server::selectActiveConsumerGroups)
+        .thenApply(groups -> trace(groups, () -> "Existing consumer groups"));
+  }
+
+  private CompletionStage<Collection<String>> extraMembers(final String consumerGroupId) {
+    return describeConsumerGroups(set(consumerGroupId), getAdmin())
+        .thenApply(
+            map ->
+                extraMembers(
+                    trace(
+                        map.get(consumerGroupId).members(), consumerGroupId, () -> "All members")));
   }
 
   private Admin getAdmin() {
@@ -518,6 +547,18 @@ public class Server {
     }
 
     return admin;
+  }
+
+  private CompletionStage<String> getConsumerGroup(
+      final String username, final String topic, final int index) {
+    final String group = groupId(username, topic, index);
+
+    return describeConsumerGroups(set(group), getAdmin())
+        .thenComposeAsync(
+            map ->
+                map.isEmpty() || isFree(map.get(group).state())
+                    ? completedFuture(trace(group, group, () -> "Didn't exist yet or was free"))
+                    : getConsumerGroup(username, topic, index + 1));
   }
 
   private RequestHandler handler() {
@@ -530,20 +571,17 @@ public class Server {
         getUsername(request, fallbackCookie)
             .map(
                 u ->
-                    getConsumerGroup(u, topic, getAdmin(), 0)
+                    getConsumerGroup(u, topic, 0)
                         .thenComposeAsync(
                             group ->
-                                latestOffsets(u, topic, getAdmin())
+                                latestOffsets(u, topic)
                                     .thenComposeAsync(
                                         latest -> goToLatest(group, latest, getAdmin()))
                                     .thenApply(latest -> group))
                         .thenComposeAsync(
                             group ->
                                 simpleResponse(
-                                    response,
-                                    OK,
-                                    MIME_TYPE,
-                                    sseStream(u, consumer, group, config, getAdmin())))
+                                    response, OK, MIME_TYPE, sseStream(u, consumer, group)))
                         .exceptionally(
                             t -> {
                               admin = null;
@@ -554,10 +592,25 @@ public class Server {
             .orElseGet(() -> simpleResponse(response, UNAUTHORIZED, empty()));
   }
 
+  private CompletionStage<Map<TopicPartition, OffsetAndMetadata>> latestOffsets(
+      final String username, final String topic) {
+    return existingConsumerGroups(username, topic)
+        .thenComposeAsync(groups -> topicPartitions(topic, admin).thenApply(p -> pair(groups, p)))
+        .thenComposeAsync(
+            pair ->
+                topicPartitionOffsets(pair.second, admin)
+                    .thenComposeAsync(
+                        topicOffsets ->
+                            consumerGroupOffsets(pair.first, pair.second, admin)
+                                .thenApply(
+                                    groupOffsets -> latestOffsets(groupOffsets, topicOffsets))));
+  }
+
   public CompletionStage<Boolean> run() {
     final State<Boolean> stop = new State<>(false);
 
     startCleanUpSseConsumerGroups(stop);
+    createServer();
 
     return httpServer
         .run()
@@ -568,12 +621,15 @@ public class Server {
             });
   }
 
+  private void sendTrace(final String topic, final JsonObject message) {
+    traceMessage(message)
+        .ifPresent(m -> producer.send(new ProducerRecord<>(topic, message.getString(CORR), m)));
+  }
+
   private Publisher<ByteBuf> sseStream(
       final String username,
       final Function<String, KafkaConsumer<String, JsonObject>> consumer,
-      final String consumerGroupId,
-      final Config config,
-      final Admin admin) {
+      final String consumerGroupId) {
     final State<Boolean> completed = new State<>(false);
     final Function<JsonObject, String> getEventName = getEventName(config);
     final Function<JsonObject, Stream<String>> getSubscriptions = getSubscriptions(config);
@@ -585,7 +641,7 @@ public class Server {
             .withConsumer(() -> consumer.apply(consumerGroupId))
             .withStopImmediately(true)
             .withStopWhenNothingLeft(true)
-            .withEventHandler(addRaceCheck(eventHandler, consumerGroupId, config));
+            .withEventHandler(addRaceCheck(eventHandler, consumerGroupId));
 
     new Thread(
             () -> {
@@ -598,18 +654,17 @@ public class Server {
     return with(Merge.of(
             with(source.publishers().get(topic))
                 .map(ConsumerRecord::value)
-                .map(
-                    json ->
-                        evictExtraMembersIfRace(
-                            trace(json, consumerGroupId), consumerGroupId, admin))
+                .map(json -> evictExtraMembersIfRace(trace(json, consumerGroupId), consumerGroupId))
                 .filter(json -> !json.containsKey(CONSUMER_GPOUP_ID))
                 .filter(
                     json ->
                         username.equals(getUsername.apply(json))
                             || getSubscriptions.apply(json).anyMatch(s -> s.equals(username)))
+                .map(eventTracer())
                 .map(
                     json ->
                         "event: " + getEventName.apply(json) + "\ndata: " + string(json) + "\n\n")
+                .map(eventCounter())
                 .get(),
             with(generate(() -> ":\n")).throttle(1).get()))
         .buffer(100, ofSeconds(1))
@@ -620,12 +675,48 @@ public class Server {
   }
 
   public void start() {
-    startCleanUpSseConsumerGroups(new State<>(false));
-    httpServer.start();
+    run().toCompletableFuture().join();
   }
 
   private void startCleanUpSseConsumerGroups(final State<Boolean> stop) {
     runCleanUpSseConsumerGroups(config.getString(TOPIC), this::getAdmin, t -> admin = null, stop);
+  }
+
+  private <T> T trace(final T v, final Supplier<String> message) {
+    trace(v, null, message);
+
+    return v;
+  }
+
+  private <T> T trace(final T v, final String consumerGroupId) {
+    return trace(v, consumerGroupId, null);
+  }
+
+  private <T> T trace(final T v, final String consumerGroupId, final Supplier<String> message) {
+    LOGGER.finest(
+        () ->
+            instance
+                + (consumerGroupId != null ? (": " + consumerGroupId) : "")
+                + ": "
+                + v.toString()
+                + (message != null ? (": " + message.get()) : ""));
+
+    return v;
+  }
+
+  private Optional<JsonObject> traceMessage(final JsonObject json) {
+    final Function<JsonObject, String> getUsername = getUsername(config);
+
+    return getString(json, "/" + CORR)
+        .map(
+            corr ->
+                eventTrace
+                    .withTraceId(corr)
+                    .withTimestamp(now())
+                    .withAttributes(attributesMap)
+                    .withUsername(getUsername.apply(json))
+                    .toJson()
+                    .build());
   }
 
   public Server withConfig(final Config config) {
