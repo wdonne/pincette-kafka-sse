@@ -13,6 +13,7 @@ import static net.pincette.kafka.sse.Common.VERSION;
 import static net.pincette.kafka.sse.Common.namespace;
 import static net.pincette.util.Util.initLogging;
 import static net.pincette.util.Util.isInteger;
+import static net.pincette.util.Util.tryToDoWithRethrow;
 
 import com.typesafe.config.Config;
 
@@ -35,6 +36,6 @@ public class Application {
     initLogging();
     addOtelLogger(config);
     LOGGER.info(() -> "Version " + VERSION);
-    new Server().withPort(parseInt(args[0])).withConfig(config).start();
+    tryToDoWithRethrow(Server::new, s -> s.withPort(parseInt(args[0])).withConfig(config).start());
   }
 }

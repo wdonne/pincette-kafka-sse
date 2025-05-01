@@ -30,6 +30,7 @@ A few OpenTelemetry observable counters are emitted every minute. The following 
 
 |Counter|Description|
 |---|---|
+|http.server.active_requests|The current number of open connections.|
 |http.server.average_duration_millis|The average request duration in the measured interval.|
 |http.server.average_request_bytes|The average request body size in bytes in the measured interval.|
 |http.server.average_response_bytes|The average response body size in bytes in the measured interval.|

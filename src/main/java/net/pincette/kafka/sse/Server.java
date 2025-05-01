@@ -25,7 +25,6 @@ import static net.pincette.jes.JsonFields.JWT;
 import static net.pincette.jes.JsonFields.SUB;
 import static net.pincette.jes.JsonFields.SUBSCRIPTIONS;
 import static net.pincette.jes.tel.OtelUtil.metrics;
-import static net.pincette.jes.tel.OtelUtil.resettingCounter;
 import static net.pincette.jes.util.Kafka.adminConfig;
 import static net.pincette.jes.util.Kafka.consumerGroupOffsets;
 import static net.pincette.jes.util.Kafka.createReliableProducer;
@@ -69,20 +68,20 @@ import static org.apache.kafka.clients.CommonClientConfigs.GROUP_INSTANCE_ID_CON
 import static org.apache.kafka.clients.consumer.ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG;
 import static org.apache.kafka.clients.consumer.ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG;
 import static org.apache.kafka.clients.consumer.ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG;
-import static org.apache.kafka.common.ConsumerGroupState.DEAD;
-import static org.apache.kafka.common.ConsumerGroupState.EMPTY;
-import static org.apache.kafka.common.ConsumerGroupState.UNKNOWN;
+import static org.apache.kafka.common.GroupState.DEAD;
+import static org.apache.kafka.common.GroupState.EMPTY;
+import static org.apache.kafka.common.GroupState.UNKNOWN;
 
 import com.typesafe.config.Config;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.handler.codec.http.HttpRequest;
-import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.api.common.Attributes;
-import java.io.Closeable;
+import io.opentelemetry.api.metrics.Meter;
+import io.opentelemetry.api.metrics.ObservableLongCounter;
+import io.opentelemetry.api.metrics.ObservableLongUpDownCounter;
 import java.time.Duration;
 import java.util.Collection;
-import java.util.HashSet;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Objects;
@@ -109,7 +108,6 @@ import net.pincette.netty.http.HttpServer;
 import net.pincette.netty.http.Metrics;
 import net.pincette.netty.http.RequestHandler;
 import net.pincette.rs.Merge;
-import net.pincette.rs.PassThrough;
 import net.pincette.rs.Source;
 import net.pincette.rs.kafka.ConsumerEvent;
 import net.pincette.rs.kafka.KafkaPublisher;
@@ -126,14 +124,14 @@ import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerRecord;
-import org.apache.kafka.common.ConsumerGroupState;
+import org.apache.kafka.common.GroupState;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.TimeoutException;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 
-public class Server implements Closeable {
+public class Server implements AutoCloseable {
   private static final String ACCESS_TOKEN = "access_token";
   private static final Duration CLEAN_UP_INTERVAL = ofSeconds(60);
   private static final String CONSUMER_GPOUP_ID = "consumerGroupId";
@@ -143,6 +141,7 @@ public class Server implements Closeable {
   private static final String EVENT_NAME = "eventName";
   private static final String EVENT_NAME_FIELD = "eventNameField";
   private static final String FALLBACK_COOKIE = "fallbackCookie";
+  private static final String HTTP_SERVER_ACTIVE_REQUESTS = "http.server.active_requests";
   private static final String HTTP_SERVER_SSE_EVENTS = "http.server.sse_events";
   private static final String INSTANCE_ATTRIBUTE = "instance";
   private static final String INSTANCE_ENV = "INSTANCE";
@@ -156,18 +155,21 @@ public class Server implements Closeable {
   private static final String TRACES_TOPIC = "tracesTopic";
   private static final String USERNAME_FIELD = "usernameField";
 
+  private long activeRequests;
+  private ObservableLongUpDownCounter activeRequestsCounter;
   private Admin admin;
   private final Map<String, Object> adminConfig;
   private final Config config;
-  private final Set<AutoCloseable> eventCounters = new HashSet<>();
+  private ObservableLongCounter eventCounter;
   private final BiConsumer<ConsumerEvent, KafkaConsumer<String, JsonObject>> eventHandler;
   private final EventTrace eventTrace;
+  private long events;
   private HttpServer httpServer;
   private final String instance = ofNullable(getenv(INSTANCE_ENV)).orElse(randomUUID().toString());
   private final Attributes attributes = Attributes.of(stringKey(INSTANCE_ATTRIBUTE), instance);
   private final Map<String, String> attributesMap = map(pair(INSTANCE_ATTRIBUTE, instance));
   private final Map<String, Object> kafkaConfig;
-  private OpenTelemetry metrics;
+  private Meter meter;
   private final int port;
   private Producer<String, JsonObject> producer;
 
@@ -243,7 +245,7 @@ public class Server implements Closeable {
   private static Collection<String> emptySseConsumerGroups(
       final Collection<ConsumerGroupListing> consumerGroups, final String topic) {
     return consumerGroups.stream()
-        .filter(l -> l.state().map(s -> s == EMPTY).orElse(false))
+        .filter(l -> l.groupState().map(s -> s == EMPTY).orElse(false))
         .map(ConsumerGroupListing::groupId)
         .filter(id -> isSseConsumerGroup(id, topic))
         .toList();
@@ -339,7 +341,7 @@ public class Server implements Closeable {
         .orElse(h -> h);
   }
 
-  private static boolean isFree(final ConsumerGroupState state) {
+  private static boolean isFree(final GroupState state) {
     return state == DEAD || state == EMPTY || state == UNKNOWN;
   }
 
@@ -387,9 +389,8 @@ public class Server implements Closeable {
     return Source.of(wrappedBuffer(message.getBytes(UTF_8)));
   }
 
-  private static Subscriber<Metrics> metricsSubscriber(
-      final OpenTelemetry metrics, final String instance) {
-    return HttpMetrics.subscriber(metrics.getMeter(SSE), path -> null, instance);
+  private static Subscriber<Metrics> metricsSubscriber(final Meter meter, final String instance) {
+    return HttpMetrics.subscriber(meter, path -> null, instance);
   }
 
   private static KafkaProducer<String, JsonObject> producer(final Config config) {
@@ -418,9 +419,19 @@ public class Server implements Closeable {
   private static Set<String> selectActiveConsumerGroups(
       final Map<String, ConsumerGroupDescription> groups) {
     return groups.entrySet().stream()
-        .filter(e -> e.getValue().state() != DEAD)
+        .filter(e -> e.getValue().groupState() != DEAD)
         .map(Entry::getKey)
         .collect(toSet());
+  }
+
+  private ObservableLongUpDownCounter activeRequestsCounter() {
+    return ofNullable(meter)
+        .map(
+            m ->
+                m.upDownCounterBuilder(HTTP_SERVER_ACTIVE_REQUESTS)
+                    .buildWithCallback(
+                        measurement -> measurement.record(activeRequests, attributes)))
+        .orElse(null);
   }
 
   private BiConsumer<ConsumerEvent, KafkaConsumer<String, JsonObject>> addRaceCheck(
@@ -451,19 +462,26 @@ public class Server implements Closeable {
       producer.close();
     }
 
-    eventCounters.forEach(v -> tryToDoSilent(v::close));
+    if (activeRequestsCounter != null) {
+      tryToDoSilent(activeRequestsCounter::close);
+    }
+
+    if (eventCounter != null) {
+      tryToDoSilent(eventCounter::close);
+    }
+
     httpServer.close();
   }
 
   private void createServer() {
-    metrics = metrics(namespace(config), SSE, VERSION, config).orElse(null);
+    meter = metrics(namespace(config), SSE, VERSION, config).map(m -> m.getMeter(SSE)).orElse(null);
     httpServer =
         new HttpServer(
             port,
             wrapTracing(
                 handle(headerHandler(config))
                     .finishWith(
-                        ofNullable(metrics)
+                        ofNullable(meter)
                             .map(m -> wrapMetrics(handler(), metricsSubscriber(m, instance)))
                             .orElseGet(this::handler)),
                 LOGGER));
@@ -471,22 +489,20 @@ public class Server implements Closeable {
     if (eventTrace != null) {
       producer = producer(config);
     }
+
+    if (meter != null) {
+      activeRequestsCounter = activeRequestsCounter();
+      eventCounter = eventCounter();
+    }
   }
 
-  private Processor<String, String> eventCounter() {
-    return ofNullable(metrics)
-        .map(OpenTelemetry::getMeterProvider)
-        .map(p -> p.meterBuilder(SSE).build())
+  private ObservableLongCounter eventCounter() {
+    return ofNullable(meter)
         .map(
             m ->
-                probeValue(
-                    resettingCounter(
-                        m,
-                        HTTP_SERVER_SSE_EVENTS,
-                        (String message) -> attributes,
-                        message -> 1,
-                        eventCounters)))
-        .orElseGet(PassThrough::passThrough);
+                m.counterBuilder(HTTP_SERVER_SSE_EVENTS)
+                    .buildWithCallback(measurement -> measurement.record(events, attributes)))
+        .orElse(null);
   }
 
   private Processor<JsonObject, JsonObject> eventTracer() {
@@ -556,7 +572,7 @@ public class Server implements Closeable {
     return describeConsumerGroups(set(group), getAdmin())
         .thenComposeAsync(
             map ->
-                map.isEmpty() || isFree(map.get(group).state())
+                map.isEmpty() || isFree(map.get(group).groupState())
                     ? completedFuture(trace(group, group, () -> "Didn't exist yet or was free"))
                     : getConsumerGroup(username, topic, index + 1));
   }
@@ -645,7 +661,9 @@ public class Server implements Closeable {
 
     new Thread(
             () -> {
+              ++activeRequests;
               source.start();
+              --activeRequests;
               completed.set(true);
               LOGGER.info(() -> "SSE stream for user " + username + " disconnected");
             })
@@ -664,7 +682,7 @@ public class Server implements Closeable {
                 .map(
                     json ->
                         "event: " + getEventName.apply(json) + "\ndata: " + string(json) + "\n\n")
-                .map(eventCounter())
+                .map(probeValue(m -> ++events))
                 .get(),
             with(generate(() -> ":\n")).throttle(1).get()))
         .buffer(100, ofSeconds(1))
