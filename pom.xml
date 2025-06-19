@@ -6,7 +6,7 @@
 
   <groupId>net.pincette</groupId>
   <artifactId>pincette-kafka-sse</artifactId>
-  <version>1.3.1</version>
+  <version>1.4.0</version>
   <name>pincette-kafka-sse</name>
   <description>Stream JSON messages from a Kafka topic to an SSE stream</description>
   <url>https://github.com/wdonne/pincette-kafka-sse</url>
@@ -57,7 +57,7 @@
     <dependency>
       <groupId>net.pincette</groupId>
       <artifactId>pincette-jes-util</artifactId>
-      <version>3.2.7</version>
+      <version>3.2.10</version>
     </dependency>
     <dependency>
       <groupId>net.pincette</groupId>
@@ -67,7 +67,7 @@
     <dependency>
       <groupId>net.pincette</groupId>
       <artifactId>pincette-netty-http</artifactId>
-      <version>3.2.7</version>
+      <version>3.2.8</version>
     </dependency>
     <dependency>
       <groupId>net.pincette</groupId>
@@ -77,12 +77,12 @@
     <dependency>
       <groupId>net.pincette</groupId>
       <artifactId>pincette-rs</artifactId>
-      <version>3.8.1</version>
+      <version>3.9.1</version>
     </dependency>
     <dependency>
       <groupId>net.pincette</groupId>
       <artifactId>pincette-rs-kafka</artifactId>
-      <version>1.2.6</version>
+      <version>1.3.0</version>
     </dependency>
     <dependency>
       <groupId>net.pincette</groupId>
@@ -186,7 +186,7 @@
               <jvmFlag>-XX:MinHeapFreeRatio=5</jvmFlag>
             </jvmFlags>
             <workingDirectory>/</workingDirectory>
-            <user>1000:1000</user>
+            <user>11000:11000</user>
           </container>
         </configuration>
       </plugin>

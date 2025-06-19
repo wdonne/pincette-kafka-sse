@@ -2,6 +2,7 @@ package net.pincette.kafka.sse;
 
 import static com.typesafe.config.ConfigFactory.defaultApplication;
 import static com.typesafe.config.ConfigValueFactory.fromAnyRef;
+import static java.lang.Thread.sleep;
 import static java.net.http.HttpClient.Version.HTTP_1_1;
 import static java.net.http.HttpClient.newBuilder;
 import static java.net.http.HttpResponse.BodyHandlers.ofPublisher;
@@ -9,7 +10,6 @@ import static java.nio.charset.StandardCharsets.US_ASCII;
 import static java.time.Instant.now;
 import static java.util.UUID.randomUUID;
 import static java.util.concurrent.CompletableFuture.allOf;
-import static java.util.stream.Collectors.toMap;
 import static net.pincette.io.StreamConnector.copy;
 import static net.pincette.jes.util.Kafka.createReliableProducer;
 import static net.pincette.jes.util.Kafka.send;
@@ -31,6 +31,7 @@ import static net.pincette.util.Collections.map;
 import static net.pincette.util.Collections.set;
 import static net.pincette.util.Pair.pair;
 import static net.pincette.util.StreamUtil.rangeExclusive;
+import static net.pincette.util.Util.initLogging;
 import static net.pincette.util.Util.tryToDoRethrow;
 import static net.pincette.util.Util.tryToDoWithRethrow;
 import static net.pincette.util.Util.tryToGetRethrow;
@@ -51,7 +52,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionStage;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Stream;
@@ -63,15 +63,12 @@ import net.pincette.kafka.json.JsonSerializer;
 import net.pincette.util.Pair;
 import net.pincette.util.State;
 import org.apache.kafka.clients.admin.Admin;
-import org.apache.kafka.clients.admin.ConsumerGroupDescription;
-import org.apache.kafka.clients.admin.ConsumerGroupListing;
-import org.apache.kafka.clients.admin.MemberToRemove;
 import org.apache.kafka.clients.admin.NewTopic;
-import org.apache.kafka.clients.admin.RemoveMembersFromConsumerGroupOptions;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -100,38 +97,6 @@ class TestServer {
         .withValue("subscriptionsField", fromAnyRef(SUBSCRIPTIONS))
         .withValue("abandonedMessageLag", fromAnyRef(-1))
         .withValue("kafka.bootstrap.servers", fromAnyRef(BOOTSTRAP_SERVER));
-  }
-
-  private static Map<String, Collection<MemberToRemove>> convertToMemberToRemove(
-      final Map<String, ConsumerGroupDescription> map) {
-    return map(
-        map.entrySet().stream()
-            .map(
-                e ->
-                    pair(
-                        e.getKey(),
-                        e.getValue().members().stream()
-                            .flatMap(member -> member.groupInstanceId().stream())
-                            .map(MemberToRemove::new)
-                            .toList())));
-  }
-
-  private static void deleteConsumerGroups() {
-    admin
-        .listConsumerGroups()
-        .all()
-        .toCompletionStage()
-        .thenApply(TestServer::selectGroupIds)
-        .thenComposeAsync(TestServer::removeConsumerGroupMembers)
-        .thenComposeAsync(groups -> admin.deleteConsumerGroups(groups).all().toCompletionStage())
-        .toCompletableFuture()
-        .join();
-  }
-
-  private static Map<String, CompletableFuture<Void>> getReady(final int numberOfUsers) {
-    return usernames(numberOfUsers)
-        .map(u -> u + "-" + TOPIC + "-0")
-        .collect(toMap(u -> u, u -> new CompletableFuture<>()));
   }
 
   private static NewTopic newTopic(final String name) {
@@ -173,72 +138,48 @@ class TestServer {
         .build();
   }
 
-  private static CompletionStage<Collection<String>> removeConsumerGroupMembers(
-      final Collection<String> groupIds) {
-    return admin
-        .describeConsumerGroups(groupIds)
-        .all()
-        .toCompletionStage()
-        .thenApply(TestServer::convertToMemberToRemove)
-        .thenComposeAsync(TestServer::removeConsumerGroupMembers);
-  }
-
-  private static CompletionStage<Collection<String>> removeConsumerGroupMembers(
-      final Map<String, Collection<MemberToRemove>> toRemove) {
-    return allOf(
-            toRemove.entrySet().stream()
-                .map(
-                    e ->
-                        admin
-                            .removeMembersFromConsumerGroup(
-                                e.getKey(), new RemoveMembersFromConsumerGroupOptions(e.getValue()))
-                            .all()
-                            .toCompletionStage()
-                            .toCompletableFuture())
-                .toArray(CompletableFuture[]::new))
-        .thenApply(v -> toRemove.keySet());
-  }
-
-  private static CompletableFuture<Void> runUser(final String username, final int maxMessages) {
+  private static Pair<CompletableFuture<Void>, CompletableFuture<Void>> runUser(
+      final String username, final int maxMessages, final int concurrent) {
     final CompletableFuture<Void> done = new CompletableFuture<>();
+    final CompletableFuture<Void> ready = new CompletableFuture<>();
 
-    client
-        .sendAsync(request(username), ofPublisher())
-        .thenApply(TestServer::ok)
-        .thenAccept(
-            resp -> {
-              final State<Integer> lastValue = new State<>(-1);
+    for (int i = 0; i < concurrent; i++) {
+      final int max = i % 2 == 0 ? maxMessages : (maxMessages / 2);
 
-              with(resp.body())
-                  .map(flattenList())
-                  .map(lines())
-                  .filter(line -> line.startsWith("data:"))
-                  .map(line -> line.substring("data:".length()).trim())
-                  .map(TestServer::value)
-                  .filter(value -> value != -1)
-                  .map(
-                      value -> {
-                        assertEquals(lastValue.get() + 1, value);
-                        lastValue.set(value);
-                        return value;
-                      })
-                  .until(value -> value == maxMessages - 1)
-                  .get()
-                  .subscribe(onComplete(() -> done.complete(null)));
-            });
+      client
+          .sendAsync(request(username), ofPublisher())
+          .thenApply(TestServer::ok)
+          .thenAccept(
+              resp -> {
+                final State<Integer> lastValue = new State<>(-1);
 
-    return done;
+                ready.complete(null);
+
+                with(resp.body())
+                    .map(flattenList())
+                    .map(lines())
+                    .filter(line -> line.startsWith("data:"))
+                    .map(line -> line.substring("data:".length()).trim())
+                    .map(TestServer::value)
+                    .filter(value -> value != -1)
+                    .map(
+                        value -> {
+                          assertEquals(lastValue.get() + 1, value);
+                          lastValue.set(value);
+                          return value;
+                        })
+                    .until(value -> value == max - 1)
+                    .get()
+                    .subscribe(onComplete(() -> done.complete(null)));
+              });
+    }
+
+    return pair(ready, done);
   }
 
-  private static Stream<CompletableFuture<Void>> runUsers(final int number, final int maxMessages) {
-    return usernames(number).map(username -> runUser(username, maxMessages));
-  }
-
-  private static Collection<String> selectGroupIds(final Collection<ConsumerGroupListing> groups) {
-    return groups.stream()
-        .map(ConsumerGroupListing::groupId)
-        .filter(s -> s.contains("-" + TOPIC + "-"))
-        .toList();
+  private static Stream<Pair<CompletableFuture<Void>, CompletableFuture<Void>>> runUsers(
+      final int number, final int maxMessages, final int concurrent) {
+    return usernames(number).map(username -> runUser(username, maxMessages, concurrent));
   }
 
   private static void sendMessages(
@@ -261,19 +202,16 @@ class TestServer {
         });
   }
 
-  private static Server startServer(final Map<String, CompletableFuture<Void>> ready) {
+  private static Server startServer(final CompletableFuture<Void> ready) {
     final Collection<TopicPartition> partitions =
         topicPartitions(TOPIC, admin).toCompletableFuture().join();
     final Server server =
         new Server()
             .withEventHandler(
                 (event, consumer) -> {
-                  final CompletableFuture<Void> future =
-                      ready.get(consumer.groupMetadata().groupId());
-
-                  if (event == STARTED && future != null) {
+                  if (event == STARTED) {
                     consumer.seekToBeginning(partitions);
-                    future.complete(null);
+                    ready.complete(null);
                   }
                 })
             .withPort(9000)
@@ -289,14 +227,22 @@ class TestServer {
   }
 
   private static void test(
-      final Function<String, Pair<String, JsonValue>> user, final int messages, final int users) {
-    final Map<String, CompletableFuture<Void>> ready = getReady(users);
+      final Function<String, Pair<String, JsonValue>> user,
+      final int messages,
+      final int users,
+      final int concurrent) {
+    final CompletableFuture<Void> ready = new CompletableFuture<>();
     final Server server = startServer(ready);
-    final List<CompletableFuture<Void>> running = runUsers(users, messages).toList();
 
-    allOf(ready.values().toArray(CompletableFuture[]::new)).join();
+    tryToDoRethrow(() -> sleep(1000));
+
+    final List<Pair<CompletableFuture<Void>, CompletableFuture<Void>>> running =
+        runUsers(users, messages, concurrent).toList();
+
+    ready.join();
+    allOf(running.stream().map(pair -> pair.first).toArray(CompletableFuture[]::new)).join();
     sendMessages(users, messages, user);
-    allOf(running.toArray(CompletableFuture[]::new)).join();
+    allOf(running.stream().map(pair -> pair.second).toArray(CompletableFuture[]::new)).join();
     server.close();
   }
 
@@ -322,7 +268,11 @@ class TestServer {
   @AfterEach
   void afterEach() {
     deleteTopics(set(TOPIC), admin).toCompletableFuture().join();
-    deleteConsumerGroups();
+  }
+
+  @BeforeAll
+  static void beforeAll() {
+    initLogging();
   }
 
   @BeforeEach
@@ -334,12 +284,18 @@ class TestServer {
   @Test
   @DisplayName("test subscriptions")
   void testSubscriptions() {
-    test(TestServer::subscription, 10, 10);
+    test(TestServer::subscription, 10, 10, 1);
   }
 
   @Test
-  @DisplayName("test username")
-  void testUsername() {
-    test(TestServer::username, 100, 100);
+  @DisplayName("test username 1")
+  void testUsername1() {
+    test(TestServer::username, 100, 5000, 1);
+  }
+
+  @Test
+  @DisplayName("test username 2")
+  void testUsername2() {
+    test(TestServer::username, 10, 100, 4);
   }
 }

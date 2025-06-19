@@ -2,9 +2,9 @@
 
 With this [SSE](https://html.spec.whatwg.org/multipage/server-sent-events.html#server-sent-events)-endpoint, events can be served from a Kafka topic. Event-driven applications that only see Kafka can reach the end-user by forwarding events to this topic.
 
-When a user connects to the endpoint, a specific Kafka consumer group is created that is reused for subsequent connections. This turns SSE into a persistent flow, even when there are connection problems. The level of persistence is determined by the retention period of the Kafka topic. It makes sense to express this in minutes or hours instead of days.
+One instance can handle several thousands of connections. However, you may be limited by the maximum number of open file descriptors. Scaling out helps spreading the connections. All instances will see all traffic, because when a user has more than one connection, it may be served by different instances.
 
-The current Java Kafka client creates a limitation in the sense that each consumer group requires a separate thread. Therefore, one instance of the endpoint can serve only around 500 connections in a practical way. This limitation will be lifted as soon as we have a non-blocking Kafka client that doesn't need extra threads.
+As a consequence, each instance has its own Kafka consumer group. The value of the environment variable `INSTANCE` will be used as the group ID. If it is not present, a UUID will be generated instead.
 
 ## Configuration
 
@@ -44,7 +44,7 @@ The following attributes are added to the counters, except for the counter `http
 |aggregate|The name of the aggregate the request was about.|
 |http.request.method|The request method.|
 |http.response.status_code|The status code of the response.|
-|instance|The UUID of the Kafka SSE instance.|
+|instance|The identifier of the Kafka SSE instance. If the environment variable `INSTANCE` is set, its value is the identifier. Otherwise, it is a UUID.|
 
 The logs are also sent to the OpenTelemetry endpoint.
 
