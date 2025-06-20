@@ -54,6 +54,7 @@ import static net.pincette.rs.streams.Message.message;
 import static net.pincette.rs.streams.Streams.streams;
 import static net.pincette.util.Collections.map;
 import static net.pincette.util.Pair.pair;
+import static net.pincette.util.Util.getStackTrace;
 import static net.pincette.util.Util.tryToDoSilent;
 
 import com.typesafe.config.Config;
@@ -276,14 +277,18 @@ public class Server implements AutoCloseable {
   }
 
   private void closeConnection(final String username, final DequePublisher<JsonObject> queue) {
-    --activeRequests;
-    connections.get(username).remove(queue);
+    ofNullable(connections.get(username))
+        .ifPresent(
+            connection -> {
+              --activeRequests;
+              connection.remove(queue);
 
-    if (connections.get(username).isEmpty()) {
-      connections.remove(username);
-    }
+              if (connection.isEmpty()) {
+                connections.remove(username);
+              }
 
-    LOGGER.info(() -> "User " + username + " closed connection");
+              LOGGER.info(() -> INSTANCE + ": user " + username + " closed connection");
+            });
   }
 
   private Subscriber<? super Message<String, JsonObject>> consumeEvents() {
@@ -345,7 +350,7 @@ public class Server implements AutoCloseable {
   private Publisher<ByteBuf> newConnection(final String username) {
     final DequePublisher<JsonObject> publisher = new DequePublisher<>();
 
-    LOGGER.info(() -> "SSE connection for user " + username);
+    LOGGER.info(() -> INSTANCE + ": SSE connection for user " + username);
     ++activeRequests;
     connections.computeIfAbsent(username, u -> new ArrayList<>()).add(publisher);
 
@@ -376,7 +381,12 @@ public class Server implements AutoCloseable {
             with(generate(() -> ":\n")).throttle(1).get()))
         .buffer(100, ofSeconds(1))
         .map(s -> wrappedBuffer(s.getBytes(UTF_8)))
-        .map(onErrorProcessor(t -> closeConnection(username, events)))
+        .map(
+            onErrorProcessor(
+                t -> {
+                  LOGGER.fine(() -> INSTANCE + ": user " + username + ": " + getStackTrace(t));
+                  closeConnection(username, events);
+                }))
         .map(onCancelProcessor(() -> closeConnection(username, events)))
         .get();
   }

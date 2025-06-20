@@ -6,7 +6,7 @@
 
   <groupId>net.pincette</groupId>
   <artifactId>pincette-kafka-sse</artifactId>
-  <version>1.4.0</version>
+  <version>1.4.1</version>
   <name>pincette-kafka-sse</name>
   <description>Stream JSON messages from a Kafka topic to an SSE stream</description>
   <url>https://github.com/wdonne/pincette-kafka-sse</url>
@@ -77,7 +77,7 @@
     <dependency>
       <groupId>net.pincette</groupId>
       <artifactId>pincette-rs</artifactId>
-      <version>3.9.1</version>
+      <version>3.9.2</version>
     </dependency>
     <dependency>
       <groupId>net.pincette</groupId>
