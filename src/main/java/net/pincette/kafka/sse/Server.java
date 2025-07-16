@@ -42,6 +42,7 @@ import static net.pincette.rs.Filter.filter;
 import static net.pincette.rs.LambdaSubscriber.lambdaSubscriber;
 import static net.pincette.rs.PassThrough.passThrough;
 import static net.pincette.rs.Probe.probeValue;
+import static net.pincette.rs.QueuePublisher.queuePublisher;
 import static net.pincette.rs.Util.empty;
 import static net.pincette.rs.Util.generate;
 import static net.pincette.rs.Util.onCancelProcessor;
@@ -87,9 +88,9 @@ import net.pincette.netty.http.HeaderHandler;
 import net.pincette.netty.http.HttpServer;
 import net.pincette.netty.http.Metrics;
 import net.pincette.netty.http.RequestHandler;
-import net.pincette.rs.DequePublisher;
 import net.pincette.rs.Mapper;
 import net.pincette.rs.Merge;
+import net.pincette.rs.QueuePublisher;
 import net.pincette.rs.kafka.ConsumerEvent;
 import net.pincette.rs.streams.Message;
 import net.pincette.util.ImmutableBuilder;
@@ -124,7 +125,7 @@ public class Server implements AutoCloseable {
   private ObservableLongUpDownCounter activeRequestsCounter;
   private final Config config;
   private final KafkaConsumer<String, JsonObject> consumer;
-  private final Map<String, List<DequePublisher<JsonObject>>> connections = new HashMap<>();
+  private final Map<String, List<QueuePublisher<JsonObject>>> connections = new HashMap<>();
   private ObservableLongCounter eventCounter;
   private final BiConsumer<ConsumerEvent, KafkaConsumer<String, JsonObject>> eventHandler;
   private final EventTrace eventTrace;
@@ -276,7 +277,7 @@ public class Server implements AutoCloseable {
     httpServer.close();
   }
 
-  private void closeConnection(final String username, final DequePublisher<JsonObject> queue) {
+  private void closeConnection(final String username, final QueuePublisher<JsonObject> queue) {
     ofNullable(connections.get(username))
         .ifPresent(
             connection -> {
@@ -296,7 +297,7 @@ public class Server implements AutoCloseable {
         m ->
             getConnections(m.value)
                 .filter(p -> !p.isClosed())
-                .forEach(p -> p.getDeque().offerFirst(m.value)),
+                .forEach(p -> p.getQueue().add(m.value)),
         () -> {},
         Server::panic);
   }
@@ -329,7 +330,7 @@ public class Server implements AutoCloseable {
         .orElse(null);
   }
 
-  private Stream<DequePublisher<JsonObject>> getConnections(final JsonObject event) {
+  private Stream<QueuePublisher<JsonObject>> getConnections(final JsonObject event) {
     return concat(Stream.of(getUsername.apply(event)), getSubscriptions.apply(event))
         .collect(toSet())
         .stream()
@@ -348,7 +349,7 @@ public class Server implements AutoCloseable {
   }
 
   private Publisher<ByteBuf> newConnection(final String username) {
-    final DequePublisher<JsonObject> publisher = new DequePublisher<>();
+    final QueuePublisher<JsonObject> publisher = queuePublisher();
 
     LOGGER.info(() -> INSTANCE + ": SSE connection for user " + username);
     ++activeRequests;
@@ -364,7 +365,7 @@ public class Server implements AutoCloseable {
   }
 
   private Publisher<ByteBuf> sseStream(
-      final String username, final DequePublisher<JsonObject> events) {
+      final String username, final QueuePublisher<JsonObject> events) {
     return with(Merge.of(
             with(events)
                 .map(
