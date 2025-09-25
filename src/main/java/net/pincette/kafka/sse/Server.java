@@ -20,6 +20,7 @@ import static net.pincette.jes.JsonFields.JWT;
 import static net.pincette.jes.JsonFields.SUB;
 import static net.pincette.jes.JsonFields.SUBSCRIPTIONS;
 import static net.pincette.jes.tel.OtelUtil.metrics;
+import static net.pincette.jes.tel.OtelUtil.retainTraceSample;
 import static net.pincette.jes.util.Kafka.createReliableProducer;
 import static net.pincette.jes.util.Kafka.fromConfig;
 import static net.pincette.json.JsonUtil.getArray;
@@ -103,6 +104,7 @@ public class Server implements AutoCloseable {
   private static final String ACCESS_TOKEN = "access_token";
   private static final String DEFAULT_EVENT_NAME = "message";
   private static final String DEFAULT_SUBSCRIPTIONS_FIELD = SUBSCRIPTIONS;
+  private static final int DEFAULT_TRACE_SAMPLE_PERCENTAGE = 10;
   private static final String DEFAULT_USERNAME_FIELD = JWT + "." + SUB;
   private static final String EVENT_NAME = "eventName";
   private static final String EVENT_NAME_FIELD = "eventNameField";
@@ -118,6 +120,7 @@ public class Server implements AutoCloseable {
   private static final String MIME_TYPE = "text/event-stream";
   private static final String SUBSCRIPTIONS_FIELD = "subscriptionsField";
   private static final String TOPIC_NAME = "topic";
+  private static final String TRACE_SAMPLE_PERCENTAGE = "traceSamplePercentage";
   private static final String TRACES_TOPIC = "tracesTopic";
   private static final String USERNAME_FIELD = "usernameField";
 
@@ -140,6 +143,7 @@ public class Server implements AutoCloseable {
   private Meter meter;
   private final int port;
   private final String topic;
+  private final int tracePercentage;
   private final String tracesTopic;
 
   private Server(
@@ -157,6 +161,10 @@ public class Server implements AutoCloseable {
     getSubscriptions = config != null ? getSubscriptions(config) : null;
     getEventName = config != null ? getEventName(config) : null;
     eventTrace = eventTrace(config);
+    tracePercentage =
+        ofNullable(config)
+            .flatMap(c -> configValue(c::getInt, TRACE_SAMPLE_PERCENTAGE))
+            .orElse(DEFAULT_TRACE_SAMPLE_PERCENTAGE);
   }
 
   public Server() {
@@ -424,7 +432,11 @@ public class Server implements AutoCloseable {
   private Message<String, JsonObject> traceMessage(final Message<String, JsonObject> message) {
     return getString(message.value, "/" + CORR)
         .map(corr -> pair(corr, getUsername.apply(message.value)))
-        .filter(pair -> pair.second != null && connections.containsKey(pair.second))
+        .filter(
+            pair ->
+                pair.second != null
+                    && connections.containsKey(pair.second)
+                    && retainTraceSample(pair.first, tracePercentage))
         .map(
             pair ->
                 message(
