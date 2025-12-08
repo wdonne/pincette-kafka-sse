@@ -305,7 +305,7 @@ public class Server implements AutoCloseable {
         m ->
             getConnections(m.value)
                 .filter(p -> !p.isClosed())
-                .forEach(p -> p.getQueue().add(m.value)),
+                .forEach(p -> tryToDoSilent(() -> p.getQueue().add(m.value))),
         () -> {},
         Server::panic);
   }
@@ -344,7 +344,8 @@ public class Server implements AutoCloseable {
         .stream()
         .map(connections::get)
         .filter(Objects::nonNull)
-        .flatMap(List::stream);
+        .flatMap(List::stream)
+        .filter(Objects::nonNull);
   }
 
   private RequestHandler handler() {

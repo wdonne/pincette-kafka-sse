@@ -60,6 +60,7 @@ import net.pincette.io.DevNullInputStream;
 import net.pincette.json.JsonUtil;
 import net.pincette.jwt.Signer;
 import net.pincette.kafka.json.JsonSerializer;
+import net.pincette.rs.PassThrough;
 import net.pincette.util.Pair;
 import net.pincette.util.State;
 import org.apache.kafka.clients.admin.Admin;
@@ -156,6 +157,13 @@ class TestServer {
                 ready.complete(null);
 
                 with(resp.body())
+                    .map(
+                        new PassThrough<>() {
+                          @Override
+                          public void onError(Throwable t) {
+                            // Cancelling.
+                          }
+                        })
                     .map(flattenList())
                     .map(lines())
                     .filter(line -> line.startsWith("data:"))
