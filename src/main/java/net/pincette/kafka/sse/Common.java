@@ -10,7 +10,7 @@ class Common {
   static final Logger LOGGER = getLogger("net.pincette.kafka.sse");
   private static final String NAMESPACE = "namespace";
   static final String SSE = "sse";
-  static final String VERSION = "1.5.1";
+  static final String VERSION = "1.5.2";
 
   private Common() {}
 
