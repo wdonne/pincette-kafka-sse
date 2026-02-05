@@ -6,7 +6,7 @@
 
   <groupId>net.pincette</groupId>
   <artifactId>pincette-kafka-sse</artifactId>
-  <version>1.5.3</version>
+  <version>1.5.4</version>
   <name>pincette-kafka-sse</name>
   <description>Stream JSON messages from a Kafka topic to an SSE stream</description>
   <url>https://github.com/wdonne/pincette-kafka-sse</url>
@@ -57,17 +57,17 @@
     <dependency>
       <groupId>net.pincette</groupId>
       <artifactId>pincette-jes-util</artifactId>
-      <version>3.3.2</version>
+      <version>3.3.4</version>
     </dependency>
     <dependency>
       <groupId>net.pincette</groupId>
       <artifactId>pincette-kafka-json</artifactId>
-      <version>1.0.16</version>
+      <version>1.0.17</version>
     </dependency>
     <dependency>
       <groupId>net.pincette</groupId>
       <artifactId>pincette-netty-http</artifactId>
-      <version>3.2.16</version>
+      <version>3.2.17</version>
     </dependency>
     <dependency>
       <groupId>net.pincette</groupId>
@@ -77,32 +77,22 @@
     <dependency>
       <groupId>net.pincette</groupId>
       <artifactId>pincette-rs</artifactId>
-      <version>3.11.4</version>
+      <version>3.11.5</version>
     </dependency>
     <dependency>
       <groupId>net.pincette</groupId>
       <artifactId>pincette-rs-kafka</artifactId>
-      <version>1.4.5</version>
+      <version>1.4.6</version>
     </dependency>
     <dependency>
       <groupId>net.pincette</groupId>
       <artifactId>pincette-config-util</artifactId>
-      <version>1.0.3</version>
+      <version>1.0.4</version>
     </dependency>
     <dependency>
       <groupId>net.pincette</groupId>
       <artifactId>pincette-jes-tel</artifactId>
-      <version>1.0.5</version>
-    </dependency>
-    <dependency>
-      <groupId>org.apache.kafka</groupId>
-      <artifactId>kafka-clients</artifactId>
-      <version>4.1.1</version>
-    </dependency>
-    <dependency>
-      <groupId>org.lz4</groupId>
-      <artifactId>lz4-java</artifactId>
-      <version>1.8.1</version>
+      <version>1.0.7</version>
     </dependency>
     <dependency>
       <groupId>com.typesafe</groupId>
@@ -137,7 +127,7 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-assembly-plugin</artifactId>
-        <version>3.7.1</version>
+        <version>3.8.0</version>
         <executions>
           <execution>
             <phase>package</phase>
