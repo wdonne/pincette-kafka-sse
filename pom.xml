@@ -72,7 +72,7 @@
     <dependency>
       <groupId>net.pincette</groupId>
       <artifactId>pincette-jwt</artifactId>
-      <version>1.1.4</version>
+      <version>1.1.5</version>
     </dependency>
     <dependency>
       <groupId>net.pincette</groupId>
@@ -93,11 +93,6 @@
       <groupId>net.pincette</groupId>
       <artifactId>pincette-jes-tel</artifactId>
       <version>1.0.7</version>
-    </dependency>
-    <dependency>
-      <groupId>com.typesafe</groupId>
-      <artifactId>config</artifactId>
-      <version>1.4.3</version>
     </dependency>
     <dependency>
       <groupId>org.glassfish</groupId>
