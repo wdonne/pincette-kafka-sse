@@ -22,7 +22,6 @@ The configuration is managed by the [Lightbend Config package](https://github.co
 |subscriptionsField|No|The name of the field in the events that is used to extract the subscriptions. It should be an array of strings. If the username of the current user is in it, the event will also be sent there. The default value is `_subscriptions`.|
 |topic|Yes|The Kafka topic that is consumed.|
 |traceSamplePercentage|No|The percentage of distributed trace samples that are retained. The value should be between 1 and 100. The default is 10. You should use the same percentage in all components that contribute to a trace, otherwise you may see incomplete traces.|
-|tracesTopic|No|None|The Kafka topic to which event traces are sent.|
 |tracesTopic|No|The Kafka topic to which the event traces are sent.|
 |usernameField|No|The name of the field in the events that is used to extract the user name. The default value is `_jwt.sub`.|
 
