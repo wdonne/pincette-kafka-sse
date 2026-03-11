@@ -6,7 +6,7 @@
 
   <groupId>net.pincette</groupId>
   <artifactId>pincette-kafka-sse</artifactId>
-  <version>1.5.4</version>
+  <version>1.5.5</version>
   <name>pincette-kafka-sse</name>
   <description>Stream JSON messages from a Kafka topic to an SSE stream</description>
   <url>https://github.com/wdonne/pincette-kafka-sse</url>
@@ -57,42 +57,42 @@
     <dependency>
       <groupId>net.pincette</groupId>
       <artifactId>pincette-jes-util</artifactId>
-      <version>3.3.4</version>
+      <version>3.3.5</version>
     </dependency>
     <dependency>
       <groupId>net.pincette</groupId>
       <artifactId>pincette-kafka-json</artifactId>
-      <version>1.0.17</version>
+      <version>1.0.18</version>
     </dependency>
     <dependency>
       <groupId>net.pincette</groupId>
       <artifactId>pincette-netty-http</artifactId>
-      <version>3.2.17</version>
+      <version>3.2.18</version>
     </dependency>
     <dependency>
       <groupId>net.pincette</groupId>
       <artifactId>pincette-jwt</artifactId>
-      <version>1.1.5</version>
+      <version>1.1.6</version>
     </dependency>
     <dependency>
       <groupId>net.pincette</groupId>
       <artifactId>pincette-rs</artifactId>
-      <version>3.11.5</version>
+      <version>3.11.6</version>
     </dependency>
     <dependency>
       <groupId>net.pincette</groupId>
       <artifactId>pincette-rs-kafka</artifactId>
-      <version>1.4.6</version>
+      <version>1.4.8</version>
     </dependency>
     <dependency>
       <groupId>net.pincette</groupId>
       <artifactId>pincette-config-util</artifactId>
-      <version>1.0.4</version>
+      <version>1.0.5</version>
     </dependency>
     <dependency>
       <groupId>net.pincette</groupId>
       <artifactId>pincette-jes-tel</artifactId>
-      <version>1.0.7</version>
+      <version>1.0.8</version>
     </dependency>
     <dependency>
       <groupId>org.glassfish</groupId>
@@ -112,7 +112,7 @@
     <dependency>
       <groupId>org.junit.jupiter</groupId>
       <artifactId>junit-jupiter</artifactId>
-      <version>5.14.1</version>
+      <version>6.0.3</version>
       <scope>test</scope>
     </dependency>
   </dependencies>
