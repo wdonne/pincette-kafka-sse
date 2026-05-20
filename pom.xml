@@ -169,6 +169,9 @@
           </to>
           <container>
             <mainClass>net.pincette.kafka.sse.Application</mainClass>
+            <args>
+              <arg>9000</arg>
+            </args>
             <jvmFlags>
               <jvmFlag>-XX:+UseZGC</jvmFlag>
               <jvmFlag>-XX:+ZGenerational</jvmFlag>
