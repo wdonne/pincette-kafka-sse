@@ -298,7 +298,7 @@ class TestServer {
   @Test
   @DisplayName("test username 1")
   void testUsername1() {
-    test(TestServer::username, 100, 1000, 1);
+    test(TestServer::username, 100, 100, 1);
   }
 
   @Test

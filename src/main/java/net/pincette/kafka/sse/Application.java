@@ -31,7 +31,7 @@ public class Application {
       exit(1);
     }
 
-    final Config config = defaultOverrides().withFallback(loadDefault());
+    final var config = loadDefault();
 
     initLogging();
     addOtelLogger(config);
