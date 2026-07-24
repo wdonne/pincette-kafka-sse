@@ -1,6 +1,5 @@
 package net.pincette.kafka.sse;
 
-import static com.typesafe.config.ConfigFactory.defaultOverrides;
 import static java.lang.Integer.parseInt;
 import static java.lang.System.exit;
 import static net.pincette.jes.tel.OtelUtil.addOtelLogHandler;
